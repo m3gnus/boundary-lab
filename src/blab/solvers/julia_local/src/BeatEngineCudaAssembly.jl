@@ -212,9 +212,15 @@ function assemble_regular_galerkin_operators_cuda_regular(
         end
     end
 
+    host_image_near_caches = _near_correction_cache_tuple(image_near_correction_cache)
+    device_image_near_caches = _near_correction_cache_tuple(cuda_image_near_correction_cache)
+    length(host_image_near_caches) == length(device_image_near_caches) || error(
+        "Each image-near correction cache needs its own device cache: got " *
+        "$(length(host_image_near_caches)) host and $(length(device_image_near_caches)) device.",
+    )
     near_cache_pairs = (
         (near_correction_cache, cuda_near_correction_cache),
-        (image_near_correction_cache, cuda_image_near_correction_cache),
+        zip(host_image_near_caches, device_image_near_caches)...,
     )
     near_pair_count = _cuda_timed_stage!(timing, "regular_operator_near_pair_corrections") do
         pair_count = 0

@@ -359,10 +359,11 @@ function assemble_burton_miller_neumann_system_cuda(
        device_near_correction_cache === nothing
         error("Direct Burton-Miller near correction requires a matching device cache.")
     end
-    if image_near_correction_cache !== nothing && image_near_correction_cache.pair_count > 0 &&
-       device_image_near_correction_cache === nothing
-        error("Direct Burton-Miller image-near correction requires a matching device cache.")
-    end
+    host_image_near_caches = _near_correction_cache_tuple(image_near_correction_cache)
+    device_image_near_caches = _near_correction_cache_tuple(device_image_near_correction_cache)
+    length(host_image_near_caches) == length(device_image_near_caches) || error(
+        "Direct Burton-Miller image-near correction requires a device cache per host cache.",
+    )
     p1_count = p1_space.global_dof_count
     matrix_re = CUDA.zeros(T, p1_count, p1_count)
     matrix_im = CUDA.zeros(T, p1_count, p1_count)
@@ -406,10 +407,11 @@ function assemble_burton_miller_neumann_system_cuda(
                 timing_prefix="direct_system_near",
             )
         end
-        if image_near_correction_cache !== nothing && image_near_correction_cache.pair_count > 0
+        for (host_cache, device_near_cache) in zip(host_image_near_caches, device_image_near_caches)
+            host_cache.pair_count == 0 && continue
             near_pair_count += add_cuda_bm_image_corrections!(
                 matrix_re, matrix_im, rhs_re, rhs_im, q_neumann,
-                mesh, k, rule, device_image_near_correction_cache, device_cache;
+                mesh, k, rule, device_near_cache, device_cache;
                 timing=timing,
                 timing_prefix="direct_system_ground_near",
             )

@@ -963,7 +963,10 @@ function assemble_regular_galerkin_operators_cpu(
     end
     timing !== nothing && (timing["image_singular_corrections_cpu_scatter"] = image_singular_elapsed)
 
-    near_caches = filter(cache -> cache !== nothing, (near_correction_cache, image_near_correction_cache))
+    near_caches = (
+        _near_correction_cache_tuple(near_correction_cache)...,
+        _near_correction_cache_tuple(image_near_correction_cache)...,
+    )
     near_pair_count = sum(cache.pair_count for cache in near_caches; init=0)
     near_elapsed = @elapsed begin
         operators = (

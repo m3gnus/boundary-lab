@@ -462,6 +462,46 @@ end
     @test combined_image_corrected.near_pair_count == 3
     @test all(isfinite, real.(combined_image_corrected.single_layer))
 
+    # A cache carries one trial_transform, so :xy -- which mirrors across x, y
+    # and both -- needs one image cache per transform. Passing a collection has
+    # to correct every one of them, not just the first.
+    xy_image_caches = [
+        build_near_correction_cache(mesh, [(1, 2)], 6; trial_transform=transform)
+        for transform in symmetry_transforms(:xy; include_identity=false)
+    ]
+    @test length(xy_image_caches) == 3
+    multi_image_corrected = assemble_regular_galerkin_operators(
+        mesh, p1, dp0, k, base_rule;
+        backend=:cpu, skip_singular=false, singular_cache=singular_cache,
+        near_correction_cache=near_cache,
+        image_near_correction_cache=xy_image_caches,
+        symmetry_mode=:xy,
+    )
+    @test multi_image_corrected.near_pair_count == near_cache.pair_count + 3
+    @test all(isfinite, real.(multi_image_corrected.single_layer))
+
+    # Correcting all three has to differ from correcting only the first, or the
+    # collection is being silently truncated.
+    first_image_only = assemble_regular_galerkin_operators(
+        mesh, p1, dp0, k, base_rule;
+        backend=:cpu, skip_singular=false, singular_cache=singular_cache,
+        near_correction_cache=near_cache,
+        image_near_correction_cache=xy_image_caches[1],
+        symmetry_mode=:xy,
+    )
+    @test first_image_only.near_pair_count == near_cache.pair_count + 1
+    @test norm(multi_image_corrected.single_layer - first_image_only.single_layer) > T(1e-12)
+
+    # A single cache must keep behaving exactly as a one-element collection.
+    one_element_collection = assemble_regular_galerkin_operators(
+        mesh, p1, dp0, k, base_rule;
+        backend=:cpu, skip_singular=false, singular_cache=singular_cache,
+        near_correction_cache=near_cache,
+        image_near_correction_cache=[xy_image_caches[1]],
+        symmetry_mode=:xy,
+    )
+    @test one_element_collection.single_layer == first_image_only.single_layer
+
     image_mesh = BoundaryMesh(
         [
             SVector{3,T}(0.01, 0, 0),
