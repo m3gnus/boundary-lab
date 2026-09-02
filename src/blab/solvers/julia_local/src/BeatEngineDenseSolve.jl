@@ -44,11 +44,16 @@
 # earlier revision of this comment claimed the operator never stagnates; that
 # was measured with the unreorthogonalised Float32 recurrence and is false. On
 # the sliver-rim ATH meshes, driven by the physical excitation rather than a
-# random one, GMRES floors at a true residual of 1.2e-6 to 9.4e-6 and cannot
-# reach 1e-6 below about 6 kHz -- the same mesh family and the same frequencies
-# where hornlab-metal-bem's GMRES returns `info=-999`. The geometry defeats
-# Krylov in both engines; what distinguishes this one is that it degrades to a
-# correct answer instead of killing the sweep.
+# random one, GMRES floors at a true residual of 1.2e-6 to 9.4e-6 -- the same
+# mesh family and the same frequencies where hornlab-metal-bem's GMRES returns
+# `info=-999`. The geometry defeats Krylov in both engines; what distinguishes
+# this one is that it degrades to a correct answer instead of killing the sweep.
+#
+# The default tolerance is 1e-5, which sits above that floor, so those meshes now
+# converge rather than falling back. The fallback stays load-bearing all the same:
+# the floor is a property of the geometry and nothing guarantees a worse mesh
+# floors below 1e-5 too. See `_beat_gmres_tolerance` for why 1e-5 is the
+# defensible number and not merely the convenient one.
 
 const BEAT_DENSE_SOLVE_METHOD_ENV = "BLAB_BEAT_DENSE_SOLVE"
 const BEAT_GMRES_TOLERANCE_ENV = "BLAB_BEAT_GMRES_TOL"
@@ -657,13 +662,56 @@ function _beat_gmres_update!(x::AbstractVector{Complex{T}},
     return nothing
 end
 
+"""Default tolerance on the true relative residual, for exterior solves.
+
+1e-5, not 1e-6. The looser value is not a speed-for-accuracy trade: measured
+against the 1e-6 answer on three meshes, with only the tolerance varying and the
+same assembly on both sides, the radiated field moves by at most **0.00100 dB**
+(A1r 500 Hz; A5 0.00060, A2r 0.00016). That is 10x below this programme's 0.01 dB
+agreement floor and 19-450x below A1r's own discretisation disagreement with
+hornlab-metal-bem.
+
+The far field is an integral over the surface solution, so "the far field did not
+move" is weaker evidence than it looks -- it averages pointwise error, and the
+tolerance is on the residual rather than on the error, which the operator's
+conditioning amplifies. Both objections are answered before any averaging, on the
+ill-conditioned mesh:
+
+    mesh   f Hz   surface solution, rel   driver mean <p>, dB
+    A1r     500          1.14e-4                0.00095
+    A1r    2000          6.5e-6                -2.2e-5
+    A5      500          3.42e-6                1.0e-6
+
+1e-4 was measured too and rejected: still negligible at 1.0e-4 relative, but it is
+where the trend becomes visible, and there is no gain worth spending that on.
+
+What this buys is convergence, not iterations. At 1e-6 the sliver-rim meshes floor
+above the target below about 6 kHz and fall back to the dense LU -- so the sweep
+pays a full GMRES budget *and* the factorization. At 1e-5 they converge: A1r is
+6.0x faster at 500 Hz and 4.1x at 2 kHz, and the routing regression does not merely
+shrink but reverses, 9.30 s against the forced LU's 11.10 s where at 1e-6 it lost
+25.28 s to 11.10 s. The well-conditioned meshes, which already converged, gain only
+the smaller 1.16-1.21x from fewer iterations -- which is what makes this a default
+rather than a conditional heuristic.
+
+**Scope: exterior Burton-Miller solves.** That is the only caller of
+`beat_solve_dense_system`; the coupled FEM/LEM path factorizes directly and is
+untouched. It is also the only case the evidence covers -- no coupled solve was
+measured at either tolerance, and this default must not be widened to one without
+that measurement.
+
+`BLAB_BEAT_GMRES_TOL` restores 1e-6 for anyone who needs the old number."""
 function _beat_gmres_tolerance(::Type{T}) where {T<:AbstractFloat}
-    return T(_beat_env_float(BEAT_GMRES_TOLERANCE_ENV, 1.0e-6))
+    return T(_beat_env_float(BEAT_GMRES_TOLERANCE_ENV, 1.0e-5))
 end
 
 function _beat_gmres_max_iterations(n::Integer)
-    # About 4x the measured 206-246 band. A run that reaches this has
-    # stagnated and belongs on the LU path, not on more iterations.
+    # A run that reaches this has stagnated and belongs on the LU path, not on
+    # more iterations. This comment used to justify the cap as "about 4x the
+    # measured 206-246 band"; that band was the unreorthogonalised Float32
+    # recurrence echoing its own restart parameter, and the real counts are
+    # 35-89. The cap is deliberately not retightened to match: it is a stall
+    # guard, and the wall-clock ceiling is what bounds a losing run.
     return _beat_env_int(BEAT_GMRES_MAX_ITERATIONS_ENV, min(Int(n), 1000))
 end
 

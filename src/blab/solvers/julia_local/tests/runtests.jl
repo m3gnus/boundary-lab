@@ -456,6 +456,19 @@ end
         @test_throws ErrorException beat_dense_solve_method("magic")
     end
 
+    @testset "the default gmres tolerance is 1e-5 and stays overridable" begin
+        # 1e-6 floors above the target on the sliver-rim meshes and sends them to
+        # the dense LU, paying a full GMRES budget and the factorization both.
+        # 1e-5 converges there and moves the radiated field by 0.001 dB.
+        @test BeatEngineCore._beat_gmres_tolerance(Float64) == 1.0e-5
+        @test BeatEngineCore._beat_gmres_tolerance(Float32) == 1.0f-5
+
+        withenv("BLAB_BEAT_GMRES_TOL" => "1e-6") do
+            @test BeatEngineCore._beat_gmres_tolerance(Float64) == 1.0e-6
+        end
+        @test BeatEngineCore._beat_gmres_tolerance(Float64) == 1.0e-5
+    end
+
     @testset "gmres and lu agree on the same system" begin
         n = 240
         rng_matrix = ComplexF32[
@@ -475,7 +488,10 @@ end
         @test gmres_report.method === :gmres
         @test !gmres_report.fell_back
         @test length(gmres_report.iterations) == 2
-        @test all(<=(1.0f-6), gmres_report.relative_residuals)
+        # The default tolerance, not a tighter number that happens to hold: this
+        # asserts the contract the router promises, and asserting 1e-6 here would
+        # silently re-pin the default that `_beat_gmres_tolerance` documents.
+        @test all(<=(1.0f-5), gmres_report.relative_residuals)
         @test norm(gmres_solution - reference) / norm(reference) < 1.0f-4
 
         lu_solution, lu_report = beat_solve_dense_system(matrix, rhs; method=:lu)
@@ -548,11 +564,16 @@ end
         end
         rhs = ComplexF32[ComplexF32(sin(0.31f0 * row), cos(0.17f0 * row)) for row in 1:n]
 
+        # Pinned, not inherited. This testset exists to catch orthogonality loss,
+        # and orthogonality loss only shows up in a long run -- so the tolerance
+        # has to be tight enough to keep the run long, independently of whatever
+        # the production default is. Taking the default here would have quietly
+        # shortened the case when that default loosened to 1e-5.
         function run(krylov_type, reorthogonalize; restart=0)
             x = zeros(ComplexF32, n)
             result = beat_gmres!(x, matrix, copy(rhs); krylov_type=krylov_type,
                                  reorthogonalize=reorthogonalize, restart=restart,
-                                 max_iterations=2000)
+                                 tolerance=1.0e-6, max_iterations=2000)
             return result, x
         end
 
