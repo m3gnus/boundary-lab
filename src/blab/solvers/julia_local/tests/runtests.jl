@@ -228,11 +228,19 @@ end
     # host. Both run in Float32, so they differ only by summation order. This
     # runs every symmetry mode because the image-singular delta is where a sign
     # slip in the fusion would be silent.
+    #
+    # Every case runs twice: uncapped, and with a coupling cap large enough to
+    # engage at this k. The uncapped run cannot see a mistake in how the cap
+    # reaches the kernels, because there the coupling scale is `inv(k)` -- the
+    # same value the code used before the cap existed. Only the capped run
+    # exercises the new argument, and it has to agree with the four-operator
+    # combination at the same cap, per element pair and through the image
+    # transforms.
     for (mesh_name, symmetry_mode) in (
         ("sample.msh", :off),
         ("sample_half.msh", :x),
         ("sample_quarter.msh", :xy),
-    )
+    ), coupling_cap in (0.0f0, Float32(2pi * 3000.0 / 343.0)^2)
         mesh = load_gmsh22_with_tags(joinpath(@__DIR__, "..", "test_meshes", mesh_name), Float32(0.001))
         mesh = snap_symmetry_planes(mesh, symmetry_mode)
         p1 = build_p1_space(mesh)
@@ -255,8 +263,12 @@ end
             symmetry_mode=symmetry_mode,
         )
         reference_lhs, reference_rhs_operator = BeatEngineCore.burton_miller_neumann_matrices(
-            operators, identity_p1_p1, identity_p1_dp0, k,
+            operators, identity_p1_p1, identity_p1_dp0, k; coupling_cap=coupling_cap,
         )
+        # The capped case must actually be capped, or this loop runs the same
+        # comparison twice and the second pass proves nothing.
+        @test (coupling_cap > 0) ==
+            (burton_miller_coupling_scale(k, coupling_cap) < burton_miller_coupling_scale(k, 0))
 
         drive_count = 3
         q_neumann = ComplexF32[
@@ -268,6 +280,7 @@ end
             identity_p1_p1=identity_p1_p1, identity_p1_dp0=identity_p1_dp0,
             skip_singular=false, singular_order=2, element_indices=element_indices,
             singular_cache=singular_cache, cpu_cache=cpu_cache, symmetry_mode=symmetry_mode,
+            coupling_cap=coupling_cap,
         )
 
         @test fused.drive_count == drive_count

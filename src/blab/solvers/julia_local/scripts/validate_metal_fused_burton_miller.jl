@@ -8,10 +8,19 @@
 # physics tolerance, and this check is stronger than the exterior/symmetry
 # validation scripts because it isolates the fusion from every other stage.
 #
+# It runs twice: uncapped, and with a coupling cap that engages at this k. The
+# capped pass is not redundant. The kernels take the coupling as a real scale
+# and uncapped that scale is `inv(k)` -- the exact value the kernels used before
+# the cap existed -- so an uncapped run cannot distinguish a correctly threaded
+# cap from one that never reaches the GPU. This is the only gate that covers
+# the Metal kernels at all, so it is the one that has to make that distinction.
+#
 #   BLAB_VALIDATE_MESH_PATH   absolute mesh path (default: the bundled sample)
 #   BLAB_VALIDATE_SCALE       mesh scale (default 0.001 for the sample)
 #   BLAB_VALIDATE_SYMMETRY    off | x | xy
 #   BLAB_VALIDATE_DRIVES      number of independent drive columns (default 2)
+#   BLAB_VALIDATE_CAP_HZ      frequency at which the capped pass engages
+#                             (default 3x the solve frequency, so it engages)
 using LinearAlgebra, Random
 
 include(joinpath(@__DIR__, "..", "src", "BeatEngineCore.jl"))
@@ -76,32 +85,59 @@ function validate_metal_fused_burton_miller()
     # host tuple is what gets released, and only once the matrices built from
     # it are materialised.
     host_operators = metal_host_operators(reference_operators)
-    reference_lhs, reference_rhs_operator = BeatEngineCore.burton_miller_neumann_matrices(
-        host_operators, identity_p1_p1, identity_p1_dp0, k,
-    )
-    reference_rhs = reference_rhs_operator * q_neumann
+    cap_hz = Float32(parse(Float64, get(ENV, "BLAB_VALIDATE_CAP_HZ", string(3 * frequency_hz))))
+    coupling_cap = (Float32(2pi) * cap_hz / 343.0f0)^2
+    passes = ((label="uncapped", cap=0.0f0), (label="capped", cap=coupling_cap))
+
+    errors = Dict{String,NTuple{3,Float64}}()
+    fused_timing = Dict{String,Float64}()
+    fused_seconds = 0.0
+    fused_lhs = fused_rhs = nothing
+    for pass in passes
+        reference_lhs, reference_rhs_operator = BeatEngineCore.burton_miller_neumann_matrices(
+            host_operators, identity_p1_p1, identity_p1_dp0, k; coupling_cap=pass.cap,
+        )
+        reference_rhs = reference_rhs_operator * q_neumann
+
+        fused = nothing
+        elapsed = @elapsed begin
+            fused = assemble_burton_miller_neumann_system_metal(
+                mesh, p1, dp0, q_neumann, k, rule;
+                device_cache=device_cache, singular_cache=singular_cache,
+                device_singular_cache=device_singular_cache,
+                identity_p1_p1=identity_p1_p1, identity_p1_dp0=identity_p1_dp0,
+                singular_order=singular_order, symmetry_mode=symmetry_mode,
+                timing=pass.cap == 0 ? fused_timing : nothing, coupling_cap=pass.cap,
+            )
+        end
+        metal.synchronize()
+        pass_lhs = Array(fused.matrix)
+        pass_rhs = Array(fused.rhs)
+        release_metal_burton_miller_system!(fused)
+
+        reference_pressure = lu(copy(reference_lhs)) \ reference_rhs
+        fused_pressure = lu(copy(pass_lhs)) \ pass_rhs
+        errors[pass.label] = (
+            relative_error(pass_lhs, reference_lhs),
+            relative_error(pass_rhs, reference_rhs),
+            relative_error(fused_pressure, reference_pressure),
+        )
+        if pass.cap == 0
+            fused_seconds = elapsed
+            fused_lhs, fused_rhs = pass_lhs, pass_rhs
+        else
+            # The capped pass has to differ from the uncapped one, or it is the
+            # same comparison run twice and proves nothing about the cap.
+            errors["capped_moved"] = (
+                relative_error(pass_lhs, fused_lhs), relative_error(pass_rhs, fused_rhs), 0.0,
+            )
+        end
+    end
     release_operator_storage!(host_operators)
 
-    fused_timing = Dict{String,Float64}()
-    fused = nothing
-    fused_seconds = @elapsed begin
-        fused = assemble_burton_miller_neumann_system_metal(
-            mesh, p1, dp0, q_neumann, k, rule;
-            device_cache=device_cache, singular_cache=singular_cache,
-            device_singular_cache=device_singular_cache,
-            identity_p1_p1=identity_p1_p1, identity_p1_dp0=identity_p1_dp0,
-            singular_order=singular_order, symmetry_mode=symmetry_mode, timing=fused_timing,
-        )
-    end
-    metal.synchronize()
-    fused_lhs = Array(fused.matrix)
-    fused_rhs = Array(fused.rhs)
-
-    lhs_error = relative_error(fused_lhs, reference_lhs)
-    rhs_error = relative_error(fused_rhs, reference_rhs)
-    reference_pressure = lu(copy(reference_lhs)) \ reference_rhs
-    fused_pressure = lu(copy(fused_lhs)) \ fused_rhs
-    pressure_error = relative_error(fused_pressure, reference_pressure)
+    lhs_error, rhs_error, pressure_error = errors["uncapped"]
+    capped_lhs_error, capped_rhs_error, capped_pressure_error = errors["capped"]
+    capped_movement = errors["capped_moved"][1]
 
     reference_bytes = 6 * p1.global_dof_count * p1.global_dof_count * sizeof(ComplexF32)
     fused_bytes = (p1.global_dof_count * p1.global_dof_count + p1.global_dof_count * drive_count) *
@@ -115,9 +151,12 @@ function validate_metal_fused_burton_miller()
     println("lhs_relative_error=$(lhs_error)")
     println("rhs_relative_error=$(rhs_error)")
     println("pressure_relative_error=$(pressure_error)")
+    println("capped_at_hz=$(cap_hz) capped_lhs_relative_error=$(capped_lhs_error) " *
+            "capped_rhs_relative_error=$(capped_rhs_error) " *
+            "capped_pressure_relative_error=$(capped_pressure_error)")
+    println("capped_vs_uncapped_lhs_change=$(capped_movement)")
     flush(stdout)
 
-    release_metal_burton_miller_system!(fused)
     release_metal_singular_correction_cache!(device_singular_cache)
     release_metal_regular_assembly_cache!(device_cache)
 
@@ -125,6 +164,15 @@ function validate_metal_fused_burton_miller()
     lhs_error <= operator_tolerance || push!(failures, "lhs_relative_error $(lhs_error) > $(operator_tolerance)")
     rhs_error <= operator_tolerance || push!(failures, "rhs_relative_error $(rhs_error) > $(operator_tolerance)")
     pressure_error <= operator_tolerance || push!(failures, "pressure_relative_error $(pressure_error) > $(operator_tolerance)")
+    capped_lhs_error <= operator_tolerance ||
+        push!(failures, "capped_lhs_relative_error $(capped_lhs_error) > $(operator_tolerance)")
+    capped_rhs_error <= operator_tolerance ||
+        push!(failures, "capped_rhs_relative_error $(capped_rhs_error) > $(operator_tolerance)")
+    capped_pressure_error <= operator_tolerance ||
+        push!(failures, "capped_pressure_relative_error $(capped_pressure_error) > $(operator_tolerance)")
+    capped_movement > 100 * operator_tolerance || push!(failures,
+        "the capped assembly differs from the uncapped one by only $(capped_movement); the cap " *
+        "is not reaching the Metal kernels, so the capped comparison proves nothing")
     if isempty(failures)
         println("RESULT=pass")
         return 0
