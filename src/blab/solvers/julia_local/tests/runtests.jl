@@ -666,6 +666,87 @@ end
     end
 end
 
+@testset "sweep assembly pipeline" begin
+    GIB = 1024^3
+
+    @testset "lookahead is derived from memory, not fixed" begin
+        # 1,209 P1 dofs is ~12 MB a system: the depth cap binds, not memory.
+        @test sweep_pipeline_depth(12_000_000, 16 * GIB, 40) == 4
+        # 20,000 dofs is ~3.2 GB a system. Half of 16 GB holds two, and both are
+        # spoken for -- the one being solved and the copy its factorization
+        # makes -- so there is nothing left to run ahead with.
+        @test sweep_pipeline_depth(3_200_000_000, 16 * GIB, 40) == 1
+        # The same system on a larger device can run ahead, up to the cap.
+        @test sweep_pipeline_depth(3_200_000_000, 64 * GIB, 40) == 4
+        # Never further ahead than there are steps left, and never past the cap.
+        @test sweep_pipeline_depth(12_000_000, 16 * GIB, 3) == 3
+        @test sweep_pipeline_depth(12_000_000, 16 * GIB, 1) == 1
+        @test sweep_pipeline_depth(12_000_000, 16 * GIB, 40; max_depth=2) == 2
+        # And never below one prefetched step, which is what shipped before and
+        # is affordable whenever the solve itself is.
+        @test sweep_pipeline_depth(12_000_000, 0, 40) == 1
+        @test sweep_pipeline_depth(3_200_000_000, 1_000_000, 40) == 1
+    end
+
+    @testset "steps are consumed in order, each paired with its own step" begin
+        for depth in (1, 2, 4, 32)
+            pipeline = start_sweep_assembly_pipeline(
+                index -> (payload=10 * index, k=Float32(index)),
+                12,
+                depth,
+                _ -> nothing,
+            )
+            taken = [take_sweep_assembly!(pipeline, index) for index in 1:12]
+            @test [entry.payload for entry in taken] == collect(10:10:120)
+            @test [entry.k for entry in taken] == Float32.(1:12)
+            @test shutdown_sweep_assembly_pipeline!(pipeline, _ -> nothing) == 0
+        end
+    end
+
+    @testset "a step built for another index is refused, never reported" begin
+        pipeline = start_sweep_assembly_pipeline(identity, 6, 2, _ -> nothing)
+        @test take_sweep_assembly!(pipeline, 1) == 1
+        # Step 2 is what the producer has next. Accepting it as step 3 would
+        # publish one frequency's field under another's label, and every number
+        # downstream would still look plausible.
+        @test_throws ErrorException take_sweep_assembly!(pipeline, 3)
+        shutdown_sweep_assembly_pipeline!(pipeline, _ -> nothing)
+    end
+
+    @testset "cancelling releases every unconsumed step and does not hang" begin
+        produced = Threads.Atomic{Int}(0)
+        released = Threads.Atomic{Int}(0)
+        note_release = _ -> (Threads.atomic_add!(released, 1); nothing)
+        pipeline = start_sweep_assembly_pipeline(
+            index -> (Threads.atomic_add!(produced, 1); index),
+            512,
+            4,
+            note_release,
+        )
+        consumed = [take_sweep_assembly!(pipeline, index) for index in 1:3]
+        @test consumed == [1, 2, 3]
+        drained = shutdown_sweep_assembly_pipeline!(pipeline, note_release)
+        @test drained >= 1
+        # The producer stopped instead of running the sweep out, and every step
+        # it built was either consumed or released: no GPU buffer is leaked.
+        @test produced[] < 512
+        @test produced[] == 3 + released[]
+        @test shutdown_sweep_assembly_pipeline!(pipeline, note_release) == 0
+    end
+
+    @testset "a failing producer surfaces through the consumer" begin
+        pipeline = start_sweep_assembly_pipeline(
+            index -> index == 2 ? error("assembly failed") : index,
+            6,
+            1,
+            _ -> nothing,
+        )
+        @test take_sweep_assembly!(pipeline, 1) == 1
+        @test_throws Exception take_sweep_assembly!(pipeline, 2)
+        shutdown_sweep_assembly_pipeline!(pipeline, _ -> nothing)
+    end
+end
+
 @testset "rigid y0 half-space Green function" begin
     T = Float32
     direct_vertices = [

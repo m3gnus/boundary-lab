@@ -137,6 +137,12 @@ export BoundaryMesh,
     load_gmsh22_with_tags,
     mesh_for_frequency,
     release_operator_storage!,
+    SweepAssemblyPipeline,
+    sweep_pipeline_depth,
+    start_sweep_assembly_pipeline,
+    take_sweep_assembly!,
+    shutdown_sweep_assembly_pipeline!,
+    metal_sweep_memory_available,
     surface_curls,
     scatter_element_block!,
     burton_miller_neumann_matrices,
@@ -1377,6 +1383,156 @@ end
 
 release_operator_storage!(operators) = nothing
 
+# ---------------------------------------------------------------------------
+# Sweep assembly pipeline
+#
+# A frequency sweep is a producer-consumer pair, not a sequence: the operator
+# assembly runs on the accelerator and the dense solve runs on the host, so one
+# frequency's assembly can proceed while the previous one is being solved,
+# evaluated and reported. The scheduler below is the generic half of that -- it
+# knows nothing about operators or frequencies, only that steps are produced in
+# ascending order on one background task and consumed in that same order on the
+# caller's task.
+#
+# Two properties are load-bearing and are why this is a single producer task
+# rather than a pool:
+#
+#   * Consumption stays in index order. The Python wrapper matches `result`
+#     events to requested frequencies positionally and rejects a mismatch, and
+#     the user-visible progress count must not jump around. `take_sweep_assembly!`
+#     asserts the invariant rather than assuming it.
+#   * Assembly stays serialized. The accelerator assembly caches carry shared
+#     per-device scratch (the Metal fused path reuses one pair-block buffer), so
+#     two concurrent assemblies would race on it, and the Metal `pair_gather`
+#     kernel's run-to-run bit reproducibility depends on one assembly owning
+#     that scratch at a time. One producer keeps both.
+# ---------------------------------------------------------------------------
+
+"""
+    sweep_pipeline_depth(system_bytes, available_bytes, remaining_steps; max_depth=4, ...)
+
+How many sweep steps the assembly producer may run ahead of the solve.
+
+Every step in flight holds its own dense operator, so the lookahead is a memory
+decision rather than a tuning constant: the producer's `depth` systems, the one
+the consumer is solving, and the copy a dense factorization makes of it must all
+fit inside `headroom` of the memory still available. Hence
+`depth = floor(headroom * available / system_bytes) - reserved_systems`.
+
+The result is clamped to at least 1, which is the behaviour that shipped before
+any of this existed -- one frequency prefetched -- and is always affordable,
+because the solve holds a system of that size regardless. It is clamped above by
+`max_depth` and by the steps that remain: a single producer feeding one
+accelerator gains nothing from running further ahead than it takes to cover
+host-side jitter.
+"""
+function sweep_pipeline_depth(
+    system_bytes::Integer,
+    available_bytes::Integer,
+    remaining_steps::Integer;
+    max_depth::Integer=4,
+    headroom::Real=0.5,
+    reserved_systems::Integer=2,
+)
+    remaining_steps <= 1 && return 1
+    ceiling = min(Int(max_depth), Int(remaining_steps))
+    ceiling <= 1 && return 1
+    system_bytes <= 0 && return ceiling
+    available_bytes <= 0 && return 1
+    budget = floor(Int128, headroom * available_bytes)
+    resident = fld(budget, Int128(system_bytes))
+    affordable = Int(clamp(resident - Int128(reserved_systems), Int128(0), Int128(ceiling)))
+    return clamp(affordable, 1, ceiling)
+end
+
+"""
+One background task assembling sweep steps ahead of the consumer, and the
+bounded channel it hands them over on. The channel's capacity *is* the
+lookahead: the producer parks on a full channel instead of allocating another
+operator.
+"""
+struct SweepAssemblyPipeline
+    channel::Channel{Tuple{Int,Any}}
+    stop::Threads.Atomic{Bool}
+    depth::Int
+end
+
+"""
+    start_sweep_assembly_pipeline(produce, step_count, depth, release)
+
+Start assembling steps `1:step_count` on one background task, at most `depth`
+ahead of the consumer. `produce(index)` builds one step; `release(payload)`
+frees one that will never be consumed.
+
+The channel is bound to the producer task, so a failure inside `produce` reaches
+the consumer through `take_sweep_assembly!` rather than surfacing as a closed
+channel.
+"""
+function start_sweep_assembly_pipeline(produce, step_count::Integer, depth::Integer, release)
+    capacity = max(1, Int(depth))
+    steps = Int(step_count)
+    stop = Threads.Atomic{Bool}(false)
+    channel = Channel{Tuple{Int,Any}}(capacity; spawn=true) do sink
+        for index in 1:steps
+            stop[] && break
+            payload = produce(index)
+            # A cancel that lands while this step was being assembled must not
+            # leak it: the consumer is gone and will never drain this one.
+            if stop[]
+                release(payload)
+                break
+            end
+            put!(sink, (index, payload))
+        end
+    end
+    return SweepAssemblyPipeline(channel, stop, capacity)
+end
+
+"""
+    take_sweep_assembly!(pipeline, index)
+
+Take step `index`'s payload, blocking until the producer has it.
+
+Raises rather than returning a payload built for a different step. Nothing in
+the design can deliver one out of order, which is exactly why the invariant is
+asserted here: a mismatched pairing would otherwise publish one frequency's
+field under another's label, and every number downstream would stay plausible.
+"""
+function take_sweep_assembly!(pipeline::SweepAssemblyPipeline, index::Integer)
+    produced_index, payload = take!(pipeline.channel)
+    produced_index == Int(index) && return payload
+    error(
+        "BEAT sweep pipeline delivered step $(produced_index) where step $(index) was next; " *
+        "results would be mismatched to their frequencies.",
+    )
+end
+
+"""
+    shutdown_sweep_assembly_pipeline!(pipeline, release)
+
+Stop the producer and release every step it built that nobody consumed. Returns
+how many were released.
+
+Draining is what makes this terminate: a producer parked on a full channel is
+only freed by a `take!`, so setting the flag alone would hang. Safe to call more
+than once, and on `nothing`.
+"""
+function shutdown_sweep_assembly_pipeline!(pipeline, release)
+    pipeline === nothing && return 0
+    pipeline.stop[] = true
+    drained = 0
+    try
+        for (_, payload) in pipeline.channel
+            release(payload)
+            drained += 1
+        end
+    catch
+        # The producer failed; its exception is the caller's to report, and
+        # there is nothing left in the channel to free.
+    end
+    return drained
+end
+
 function build_cuda_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, ::Type{T}) where {T<:AbstractFloat}
     cuda = cuda_module()
     cuda.functional() || error("CUDA Burton-Miller identity cache requested, but CUDA.functional() is false.")
@@ -1455,6 +1611,7 @@ for name in (
     :release_metal_burton_miller_system!,
     :assemble_regular_galerkin_operators_metal_regular,
     :evaluate_galerkin_field_metal,
+    :metal_sweep_memory_available,
 )
     @eval function $(name)(args...; kwargs...)
         error($(string(name)) * " requested, but Metal.jl is not loaded. Run with the julia_metal project on Apple Silicon.")

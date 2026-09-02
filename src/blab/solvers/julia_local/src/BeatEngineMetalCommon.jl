@@ -29,6 +29,23 @@ function metal_operator_storage_mode()
     return requested == "shared" ? Metal.SharedStorage : Metal.PrivateStorage
 end
 
+"""
+    metal_sweep_memory_available()
+
+Bytes the device can still take before it passes Apple's own recommended
+working set, read from Metal's counters rather than a tally we keep: the caches,
+the resident operators and anything else in the process are already inside
+`currentAllocatedSize`. Exceeding the recommendation does not fail an
+allocation, it starts paging unified memory, which is why the sweep lookahead
+is sized against what is left rather than against the total.
+"""
+function metal_sweep_memory_available()
+    device = Metal.device()
+    recommended = Int(device.recommendedMaxWorkingSetSize)
+    allocated = Int(device.currentAllocatedSize)
+    return max(0, recommended - allocated)
+end
+
 struct MetalSingularCorrectionCache{T}
     pair_offsets
     test_indices
