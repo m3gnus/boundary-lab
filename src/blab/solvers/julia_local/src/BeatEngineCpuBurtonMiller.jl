@@ -1,9 +1,10 @@
 # Fused Burton-Miller exterior assembly for the CPU backend.
 #
 # Same change as the Metal path in BeatEngineMetalBurtonMiller.jl, and for the
-# same reasons: the coupling eta = i/k is known at assembly time, so
+# same reasons: the coupling eta = i |k| / max(k^2, cap) is known at assembly
+# time, so
 #
-#   lhs = 0.5 I_p1p1 - D + (i/k) H          rhs = (-S - (i/k)(K' + 0.5 I)) q
+#   lhs = 0.5 I_p1p1 - D + eta H            rhs = (-S - eta (K' + 0.5 I)) q
 #
 # can be formed per element pair instead of assembling S, K', D and H and
 # combining them afterwards. The result is one N x N matrix and one right-hand
@@ -290,6 +291,7 @@ function assemble_burton_miller_neumann_system_cpu(
     singular_cache=nothing,
     cpu_cache=nothing,
     symmetry_mode::Symbol=:off,
+    coupling_cap::Real=zero(T),
 ) where {T<:AbstractFloat}
     symmetry_mode = normalized_symmetry_mode(symmetry_mode)
     if cpu_cache !== nothing
@@ -307,7 +309,7 @@ function assemble_burton_miller_neumann_system_cpu(
     p1_count = p1_space.global_dof_count
     lhs = zeros(Complex{T}, p1_count, p1_count)
     rhs = zeros(Complex{T}, p1_count, drive_count)
-    coupling = Complex{T}(0, 1) / k
+    coupling = burton_miller_coupling(k, coupling_cap)
     elements = cpu_cache === nothing ? _beat_cpu_element_data(mesh, p1_space, dp0_space) : cpu_cache.elements
     regular_quadrature = cpu_cache === nothing ? _beat_cpu_regular_quadrature_data(mesh, rule) : cpu_cache.regular_quadrature
     adjacent_pairs = cpu_cache === nothing ? count_adjacent_pairs(mesh, indices) : cpu_cache.adjacent_pairs

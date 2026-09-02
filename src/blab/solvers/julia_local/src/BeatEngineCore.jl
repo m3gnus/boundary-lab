@@ -139,6 +139,10 @@ export BoundaryMesh,
     release_operator_storage!,
     surface_curls,
     scatter_element_block!,
+    burton_miller_coupling,
+    burton_miller_coupling_scale,
+    burton_miller_coupling_cap,
+    burton_miller_body_radius,
     burton_miller_neumann_matrices,
     burton_miller_neumann_lhs,
     burton_miller_neumann_rhs,
@@ -1477,11 +1481,12 @@ function solve_burton_miller_neumann(
     q_neumann,
     k::T;
     return_gpu::Bool=false,
+    coupling_cap::Real=zero(T),
 ) where {T<:AbstractFloat}
     get(operators, :on_gpu, false) || error("Cached CUDA solve requires GPU-resident operators.")
     cuda = cuda_module()
     cuda.functional() || error("CUDA solve requested, but CUDA.functional() is false.")
-    coupling = Complex{T}(0, 1) / k
+    coupling = burton_miller_coupling(k, coupling_cap)
     d_q_neumann = d_lhs = d_rhs_operator = d_rhs = d_pressure = nothing
     pressure = nothing
     neumann_on_gpu = q_neumann isa cuda.CuArray
@@ -1513,17 +1518,19 @@ function solve_burton_miller_neumann(
     return pressure
 end
 
-function solve_burton_miller_neumann(operators, identity_p1_p1, identity_p1_dp0, q_neumann, k::T) where {T<:AbstractFloat}
+function solve_burton_miller_neumann(operators, identity_p1_p1, identity_p1_dp0, q_neumann, k::T;
+                                     coupling_cap::Real=zero(T)) where {T<:AbstractFloat}
     operators_on_gpu = get(operators, :on_gpu, false)
     if !operators_on_gpu
-        return solve_burton_miller_neumann_cpu(operators, identity_p1_p1, identity_p1_dp0, q_neumann, k)
+        return solve_burton_miller_neumann_cpu(operators, identity_p1_p1, identity_p1_dp0, q_neumann, k;
+                                               coupling_cap=coupling_cap)
     end
 
     gpu_backend = get(operators, :gpu_backend, :cuda)
     if gpu_backend == :rocm
         identity_cache = build_rocm_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, T)
         try
-            return solve_burton_miller_neumann(operators, identity_cache, q_neumann, k)
+            return solve_burton_miller_neumann(operators, identity_cache, q_neumann, k; coupling_cap=coupling_cap)
         finally
             release_rocm_burton_miller_identity_cache!(identity_cache)
         end
@@ -1531,7 +1538,7 @@ function solve_burton_miller_neumann(operators, identity_p1_p1, identity_p1_dp0,
     if gpu_backend == :metal
         identity_cache = build_metal_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, T)
         try
-            return solve_burton_miller_neumann(operators, identity_cache, q_neumann, k)
+            return solve_burton_miller_neumann(operators, identity_cache, q_neumann, k; coupling_cap=coupling_cap)
         finally
             release_metal_burton_miller_identity_cache!(identity_cache)
         end
@@ -1539,7 +1546,7 @@ function solve_burton_miller_neumann(operators, identity_p1_p1, identity_p1_dp0,
 
     identity_cache = build_cuda_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, T)
     try
-        return solve_burton_miller_neumann(operators, identity_cache, q_neumann, k)
+        return solve_burton_miller_neumann(operators, identity_cache, q_neumann, k; coupling_cap=coupling_cap)
     finally
         release_cuda_burton_miller_identity_cache!(identity_cache)
     end
@@ -1586,6 +1593,7 @@ function build_field_evaluation_cache(mesh::BoundaryMesh{T}, rule::TriangleRule{
     )
 end
 
+include(joinpath(@__DIR__, "BeatEngineCoupling.jl"))
 include(joinpath(@__DIR__, "BeatEngineDenseSolve.jl"))
 include(joinpath(@__DIR__, "BeatEngineCpu.jl"))
 

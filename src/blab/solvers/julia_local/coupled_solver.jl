@@ -837,6 +837,9 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     bem_domain = aggregate_bem_region(meshes, unbounded_region, boundaries, FloatType)
     mesh = snap_symmetry_planes(bem_domain.mesh, symmetry_mode)
     validate_symmetry_fundamental_domain!(mesh, symmetry_mode)
+    # Same capped Burton-Miller coupling as the exterior solver, derived from
+    # the same body: c = 1/R^2, inert above kR = 1.
+    coupling_cap = BeatEngineCore.burton_miller_coupling_cap(mesh; symmetry_mode=symmetry_mode)
     excitation_port_ids = String.(request["excitation_port_ids"])
     excitations = exterior_excitations(
         excitation_port_ids,
@@ -988,7 +991,8 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
             assembly_s = (time_ns() - assembly_started) / 1.0e9
             solve_started = time_ns()
             cpu_system = backend in (:cpu, :metal) ? build_burton_miller_neumann_cpu_system(
-                operators, selected_identity[1], selected_identity[2], wavenumber,
+                operators, selected_identity[1], selected_identity[2], wavenumber;
+                coupling_cap=coupling_cap,
             ) : nothing
             pressures = Vector{Vector{Complex{FloatType}}}()
             neumann_values = Vector{Vector{Complex{FloatType}}}()
@@ -997,7 +1001,8 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 pressure = backend in (:cpu, :metal) ?
                            solve_burton_miller_neumann_cpu_system(cpu_system, neumann, FloatType) :
                            solve_burton_miller_neumann(
-                    operators, device_identity_cache, neumann, wavenumber,
+                    operators, device_identity_cache, neumann, wavenumber;
+                    coupling_cap=coupling_cap,
                 )
                 push!(pressures, Complex{FloatType}.(pressure))
                 push!(neumann_values, neumann)

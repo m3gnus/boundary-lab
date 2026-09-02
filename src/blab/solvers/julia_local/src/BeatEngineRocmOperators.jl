@@ -225,13 +225,14 @@ function solve_burton_miller_neumann(
     operators,
     identity_cache::RocmBurtonMillerIdentityCache,
     q_neumann,
-    k::T,
+    k::T;
+    coupling_cap::Real=zero(T),
 ) where {T<:AbstractFloat}
     get(operators, :on_gpu, false) || error("Cached ROCm solve requires GPU-resident operators.")
     get(operators, :gpu_backend, nothing) == :rocm || error("Cached ROCm solve requires ROCm operators.")
     _require_rocm!(rocsolver=true)
 
-    coupling = Complex{T}(0, 1) / k
+    coupling = burton_miller_coupling(k, coupling_cap)
     d_q_neumann = d_lhs = d_rhs = d_pressure = nothing
     pressure = nothing
     try

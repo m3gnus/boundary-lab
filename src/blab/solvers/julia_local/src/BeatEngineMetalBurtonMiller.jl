@@ -124,18 +124,19 @@ function _release_metal_fused_gather_tables!(cache::MetalRegularAssemblyCache)
     return nothing
 end
 
-# lhs contribution of a pair: -D + (i/k) H, so
-#   re = -D_re - H_im / k      im = -D_im + H_re / k
-# rhs coefficient of a pair: -S - (i/k) K', so
-#   re = -S_re + K'_im / k     im = -S_im - K'_re / k
+# lhs contribution of a pair: -D + eta H with eta = i * s, so
+#   re = -D_re - s H_im        im = -D_im + s H_re
+# rhs coefficient of a pair: -S - eta K', so
+#   re = -S_re + s K'_im       im = -S_im - s K'_re
+# `s` is `burton_miller_coupling_scale(k, cap)`; it is 1/k uncapped.
 # Identical algebra to `burton_miller_neumann_matrices`, formed per pair.
 @inline function _metal_fused_pair_combination(
-    slp_re, slp_im, adj_re, adj_im, dlp_re, dlp_im, hyp_re, hyp_im, inverse_k,
+    slp_re, slp_im, adj_re, adj_im, dlp_re, dlp_im, hyp_re, hyp_im, coupling_scale,
 )
-    lhs_re = -dlp_re - inverse_k * hyp_im
-    lhs_im = -dlp_im + inverse_k * hyp_re
-    rhs_re = -slp_re + inverse_k * adj_im
-    rhs_im = -slp_im - inverse_k * adj_re
+    lhs_re = -dlp_re - coupling_scale * hyp_im
+    lhs_im = -dlp_im + coupling_scale * hyp_re
+    rhs_re = -slp_re + coupling_scale * adj_im
+    rhs_im = -slp_im - coupling_scale * adj_re
     return lhs_re, lhs_im, rhs_re, rhs_im
 end
 
@@ -169,7 +170,7 @@ end
     trial_index::Int32,
     face_count::Int32,
     k,
-    inverse_k,
+    coupling_scale,
     ::Val{R},
     trial_sign_x,
     trial_sign_y,
@@ -194,8 +195,8 @@ end
     normal_product = test_nx * trial_nx + test_ny * trial_ny + test_nz * trial_nz
     jac_scale = T(4) * areas[test_index] * areas[trial_index]
     trial_signs = SVector(trial_sign_x, trial_sign_y, trial_sign_z)
-    # -(i/k) * k^2 (n.n'), folded into the per-test-point combination.
-    curl_scale = inverse_k * k * k * normal_product
+    # -eta * k^2 (n.n'), folded into the per-test-point combination.
+    curl_scale = coupling_scale * k * k * normal_product
 
     g_total_re = zero(k)
     g_total_im = zero(k)
@@ -229,8 +230,8 @@ end
             context, Val(R), Val(R),
         )
         # rhs coefficient: -S - (i/k) K'
-        rhs_re += test_basis * (-s_re + inverse_k * a_im)
-        rhs_im += test_basis * (-s_im - inverse_k * a_re)
+        rhs_re += test_basis * (-s_re + coupling_scale * a_im)
+        rhs_im += test_basis * (-s_im - coupling_scale * a_re)
         g_total_re += s_re
         g_total_im += s_im
         # lhs: -D + (i/k) H, less the curl term added after the loop.
@@ -259,8 +260,8 @@ end
         trial_curl_sign_y,
         trial_curl_sign_z,
     )
-    lhs_re -= curl_products * (inverse_k * g_total_im)
-    lhs_im += curl_products * (inverse_k * g_total_re)
+    lhs_re -= curl_products * (coupling_scale * g_total_im)
+    lhs_im += curl_products * (coupling_scale * g_total_re)
     return lhs_re, lhs_im, rhs_re, rhs_im
     end
 end
@@ -281,7 +282,7 @@ function _metal_fused_pair_blocks_kernel!(
     chunk_count::Int32,
     pair_stride::Int32,
     k,
-    inverse_k,
+    coupling_scale,
     face_count::Int32,
     ::Val{R},
     pair_offsets,
@@ -329,7 +330,7 @@ function _metal_fused_pair_blocks_kernel!(
         trial_index,
         face_count,
         k,
-        inverse_k,
+        coupling_scale,
         Val(R),
         trial_sign_x,
         trial_sign_y,
@@ -481,6 +482,7 @@ function _launch_metal_fused_pair_kernels!(
     q_neumann,
     cache::MetalRegularAssemblyCache,
     k,
+    coupling_scale,
     pair_offsets,
     singular_trial_indices,
     skip_mode,
@@ -525,7 +527,7 @@ function _launch_metal_fused_pair_kernels!(
             Int32(chunk_count),
             pair_stride,
             k,
-            inv(k),
+            coupling_scale,
             Int32(cache.face_count),
             Val(rule_count),
             pair_offsets,
@@ -609,7 +611,7 @@ function _metal_singular_fused_bm_blocks_kernel!(
     normals,
     curls,
     k,
-    inverse_k,
+    coupling_scale,
     face_count::Int32,
     pair_count::Int32,
     rule_point_count::Int32,
@@ -632,7 +634,7 @@ function _metal_singular_fused_bm_blocks_kernel!(
         trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
     )
     lhs_re, lhs_im, rhs_re, rhs_im = _metal_fused_pair_combination(
-        slp_re, slp_im, adj_re, adj_im, dlp_re, dlp_im, hyp_re, hyp_im, inverse_k,
+        slp_re, slp_im, adj_re, adj_im, dlp_re, dlp_im, hyp_re, hyp_im, coupling_scale,
     )
     value_stride = pair_count * part_count
     @inbounds begin
@@ -728,6 +730,7 @@ function _launch_metal_fused_singular_kernels!(
     regular_cache::MetalRegularAssemblyCache,
     singular_cache::MetalSingularCorrectionCache,
     k,
+    coupling_scale,
     transform::SymmetryTransform=SymmetryTransform(:identity, SVector{3,Int}(1, 1, 1), 1),
 )
     pair_count = singular_cache.pair_count
@@ -752,7 +755,7 @@ function _launch_metal_fused_singular_kernels!(
         singular_cache.jac_scales, singular_cache.normal_products, singular_cache.rule_offsets,
         singular_cache.rule_test_points, singular_cache.rule_trial_points, singular_cache.rule_weights,
         regular_cache.face_vertices, regular_cache.normals, regular_cache.curls,
-        k, inv(k), Int32(regular_cache.face_count), Int32(pair_count),
+        k, coupling_scale, Int32(regular_cache.face_count), Int32(pair_count),
         Int32(rule_point_count), Int32(part_count),
         sx, sy, sz, csx, csy, csz,
     )
@@ -837,6 +840,7 @@ function assemble_burton_miller_neumann_system_metal(
     element_indices=eachindex(mesh.faces),
     symmetry_mode::Symbol=:off,
     timing=nothing,
+    coupling_cap::Real=zero(T),
 ) where {T<:AbstractFloat}
     _require_metal!()
     device_cache isa MetalRegularAssemblyCache ||
@@ -857,6 +861,7 @@ function assemble_burton_miller_neumann_system_metal(
             error("Fused Metal Burton-Miller assembly needs identity_cache or both identity blocks.")
         identity_cache = build_metal_fused_identity_cache(identity_p1_p1, identity_p1_dp0, T)
     end
+    coupling_scale = burton_miller_coupling_scale(k, coupling_cap)
     d_q = q_host isa MtlArray ? q_host : MtlArray(Complex{T}.(q_host))
     owns_q = !(q_host isa MtlArray)
     tables = _metal_fused_gather_tables(device_cache)
@@ -884,13 +889,13 @@ function assemble_burton_miller_neumann_system_metal(
         one_t = one(T)
         kernel_elapsed = @elapsed begin
             _launch_metal_fused_pair_kernels!(
-                lhs, rhs_partial, d_q, device_cache, k,
+                lhs, rhs_partial, d_q, device_cache, k, coupling_scale,
                 device_cache.vertex_offsets, device_cache.incident_elements, Int32(0),
                 one_t, one_t, one_t, one_t, one_t, one_t,
             )
             for (transform, image_cache) in zip(device_cache.image_transforms, device_cache.image_singular_caches)
                 _launch_metal_fused_pair_kernels!(
-                    lhs, rhs_partial, d_q, device_cache, k,
+                    lhs, rhs_partial, d_q, device_cache, k, coupling_scale,
                     image_cache.pair_offsets, image_cache.trial_indices,
                     skip_image_singular ? Int32(1) : Int32(2),
                     T(transform.signs[1]), T(transform.signs[2]), T(transform.signs[3]),
@@ -929,7 +934,7 @@ function assemble_burton_miller_neumann_system_metal(
             active_singular_cache = device_singular_cache === nothing ?
                 build_metal_singular_correction_cache(correction_cache) : device_singular_cache
             singular_elapsed = @elapsed begin
-                _launch_metal_fused_singular_kernels!(lhs, rhs, d_q, device_cache, active_singular_cache, k)
+                _launch_metal_fused_singular_kernels!(lhs, rhs, d_q, device_cache, active_singular_cache, k, coupling_scale)
             end
             timing !== nothing && (timing["metal_fused_singular_kernel"] = singular_elapsed)
             singular_pairs = correction_cache.pair_count
@@ -937,7 +942,7 @@ function assemble_burton_miller_neumann_system_metal(
             image_elapsed = @elapsed begin
                 for (transform, image_cache) in zip(device_cache.image_transforms, device_cache.image_singular_caches)
                     image_cache.pair_count == 0 && continue
-                    _launch_metal_fused_singular_kernels!(lhs, rhs, d_q, device_cache, image_cache, k, transform)
+                    _launch_metal_fused_singular_kernels!(lhs, rhs, d_q, device_cache, image_cache, k, coupling_scale, transform)
                 end
                 Metal.synchronize()
             end
@@ -963,7 +968,7 @@ function assemble_burton_miller_neumann_system_metal(
         # drive, so both stay cheaper on the host than a kernel launch.
         identity_elapsed = @elapsed begin
             scatter_metal_sparse_to_dense!(lhs, identity_cache.p1_p1_scatter; alpha=Complex{T}(0.5), add=true)
-            coupling = Complex{T}(0, 1) / k
+            coupling = Complex{T}(zero(T), coupling_scale)
             identity_rhs = (identity_cache.p1_dp0 * Complex{T}.(q_host)) .* (-Complex{T}(0.5) * coupling)
             d_identity_rhs = MtlArray(identity_rhs)
             try

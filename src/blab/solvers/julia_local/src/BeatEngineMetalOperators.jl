@@ -196,7 +196,8 @@ function solve_burton_miller_neumann(
     operators,
     identity_cache::MetalBurtonMillerIdentityCache,
     q_neumann,
-    k::T,
+    k::T;
+    coupling_cap::Real=zero(T),
 ) where {T<:AbstractFloat}
     get(operators, :on_gpu, false) || error("Cached Metal solve requires GPU-resident operators.")
     get(operators, :gpu_backend, nothing) == :metal || error("Cached Metal solve requires Metal operators.")
@@ -207,6 +208,7 @@ function solve_burton_miller_neumann(
         identity_cache.identity_p1_p1,
         identity_cache.identity_p1_dp0,
         q_neumann,
-        k,
+        k;
+        coupling_cap=coupling_cap,
     )
 end

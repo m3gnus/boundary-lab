@@ -1425,8 +1425,9 @@ function _accelerator_coupled_bem_blocks(
     inputs_on_device::Bool=false,
     bem_motion_flux=nothing,
     bem_prescribed_neumann=nothing,
+    coupling_cap::Real=zero(T),
 ) where {T<:AbstractFloat}
-    coupling = Complex{T}(0, 1) / wavenumber
+    coupling = burton_miller_coupling(wavenumber, coupling_cap)
     d_identity_p1_p1 = d_identity_p1_dp0 = d_bem_flux = nothing
     d_lhs = d_interface_block = d_interface_temp = d_rhs_operator = nothing
     d_motion_block = d_motion_temp = nothing
@@ -1845,6 +1846,10 @@ function build_coupled_system(
     static_condensation && validation_diagnostics && error(
         "FEM static condensation cannot be combined with full-matrix validation diagnostics.",
     )
+    # The Burton-Miller coupling cap for this body, the same c = 1/R^2 the
+    # exterior solver derives. The coupled solve runs the lower end of the band
+    # harder than the exterior one does, so it is the path that gains most.
+    coupling_cap = BeatEngineCore.burton_miller_coupling_cap(bem_mesh; symmetry_mode=symmetry_mode)
     fem_stage_started = time_ns()
     resolved_transducer_operators = isnothing(transducer_operators) ?
                                     assemble_transducer_operators(
@@ -1984,6 +1989,7 @@ function build_coupled_system(
                 inputs_on_device=true,
                 bem_motion_flux=device_bem_motion_flux,
                 bem_prescribed_neumann=device_bem_prescribed_neumann,
+                coupling_cap=coupling_cap,
             )
         finally
             release_operator_storage!(operators)
@@ -1997,7 +2003,8 @@ function build_coupled_system(
             operators,
             prepared.identity_p1_p1,
             prepared.identity_p1_dp0,
-            wavenumber,
+            wavenumber;
+            coupling_cap=coupling_cap,
         )
         (
             bem_lhs=bem_lhs,

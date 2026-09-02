@@ -43,32 +43,32 @@ function configure_beat_cpu_blas_threads!(
 end
 
 """
-    burton_miller_neumann_lhs(operators, identity_p1_p1, k)
+    burton_miller_neumann_lhs(operators, identity_p1_p1, k; coupling_cap=0)
 
-`0.5 M - D + (i/k) H` as one fused broadcast.
+`0.5 M - D + eta H` as one fused broadcast, `eta = i |k| / max(k^2, cap)`.
 
 The real identity block is broadcast directly against the complex operators
 rather than promoted first: `Complex{T}.(identity_p1_p1)` materialised a full
 N x N complex copy of a matrix that is 99.9% zeros -- 419 MB at 10,230 P1 dofs,
 every frequency.
 """
-function burton_miller_neumann_lhs(operators, identity_p1_p1, k::T) where {T<:AbstractFloat}
-    coupling = Complex{T}(0, 1) / k
+function burton_miller_neumann_lhs(operators, identity_p1_p1, k::T; coupling_cap::Real=zero(T)) where {T<:AbstractFloat}
+    coupling = burton_miller_coupling(k, coupling_cap)
     return Complex{T}(0.5) .* identity_p1_p1 .- operators.double_layer .+ coupling .* operators.hypersingular
 end
 
 """
-    burton_miller_neumann_rhs(operators, identity_p1_dp0, q_neumann, k)
+    burton_miller_neumann_rhs(operators, identity_p1_dp0, q_neumann, k; coupling_cap=0)
 
-`(-S - (i/k)(K' + 0.5 M_p1dp0)) q` without ever forming that operator.
+`(-S - eta (K' + 0.5 M_p1dp0)) q` without ever forming that operator.
 
 The materialised form is N x 2N complex -- 1.67 GB at 10,230 P1 dofs -- built
 once per frequency only to be multiplied by a vector. Three matrix-vector
 products cost a fraction of writing it. This mirrors what the CUDA path already
 does above 768 dofs (`_cuda_burton_miller_rhs`).
 """
-function burton_miller_neumann_rhs(operators, identity_p1_dp0, q_neumann, k::T) where {T<:AbstractFloat}
-    coupling = Complex{T}(0, 1) / k
+function burton_miller_neumann_rhs(operators, identity_p1_dp0, q_neumann, k::T; coupling_cap::Real=zero(T)) where {T<:AbstractFloat}
+    coupling = burton_miller_coupling(k, coupling_cap)
     q = Complex{T}.(q_neumann)
     rhs = Vector{Complex{T}}(undef, size(operators.single_layer, 1))
     mul!(rhs, operators.single_layer, q, -one(Complex{T}), zero(Complex{T}))
@@ -102,29 +102,31 @@ function _add_scaled_matvec!(rhs::Vector{Complex{T}}, matrix::AbstractMatrix,
     return rhs
 end
 
-function burton_miller_neumann_matrices(operators, identity_p1_p1, identity_p1_dp0, k::T) where {T<:AbstractFloat}
-    coupling = Complex{T}(0, 1) / k
-    lhs = burton_miller_neumann_lhs(operators, identity_p1_p1, k)
+function burton_miller_neumann_matrices(operators, identity_p1_p1, identity_p1_dp0, k::T; coupling_cap::Real=zero(T)) where {T<:AbstractFloat}
+    coupling = burton_miller_coupling(k, coupling_cap)
+    lhs = burton_miller_neumann_lhs(operators, identity_p1_p1, k; coupling_cap=coupling_cap)
     rhs_operator = -operators.single_layer .- coupling .* (operators.adjoint_double_layer .+ Complex{T}(0.5) .* identity_p1_dp0)
     return lhs, rhs_operator
 end
 
-function build_burton_miller_neumann_cpu_system(operators, identity_p1_p1, identity_p1_dp0, k::T) where {T<:AbstractFloat}
+function build_burton_miller_neumann_cpu_system(operators, identity_p1_p1, identity_p1_dp0, k::T; coupling_cap::Real=zero(T)) where {T<:AbstractFloat}
     return (
-        factorization=lu!(burton_miller_neumann_lhs(operators, identity_p1_p1, k)),
+        factorization=lu!(burton_miller_neumann_lhs(operators, identity_p1_p1, k; coupling_cap=coupling_cap)),
         single_layer=operators.single_layer,
         adjoint_double_layer=operators.adjoint_double_layer,
         identity_p1_dp0=identity_p1_dp0,
         wavenumber=k,
+        coupling_cap=T(coupling_cap),
     )
 end
 
 function solve_burton_miller_neumann_cpu_system(system, q_neumann, ::Type{T}) where {T<:AbstractFloat}
-    rhs = burton_miller_neumann_rhs(system, system.identity_p1_dp0, q_neumann, system.wavenumber)
+    rhs = burton_miller_neumann_rhs(system, system.identity_p1_dp0, q_neumann, system.wavenumber;
+                                    coupling_cap=get(system, :coupling_cap, zero(system.wavenumber)))
     return Complex{T}.(system.factorization \ rhs)
 end
 
-function solve_burton_miller_neumann_cpu(operators, identity_p1_p1, identity_p1_dp0, q_neumann, k::T) where {T<:AbstractFloat}
-    system = build_burton_miller_neumann_cpu_system(operators, identity_p1_p1, identity_p1_dp0, k)
+function solve_burton_miller_neumann_cpu(operators, identity_p1_p1, identity_p1_dp0, q_neumann, k::T; coupling_cap::Real=zero(T)) where {T<:AbstractFloat}
+    system = build_burton_miller_neumann_cpu_system(operators, identity_p1_p1, identity_p1_dp0, k; coupling_cap=coupling_cap)
     return solve_burton_miller_neumann_cpu_system(system, q_neumann, T)
 end

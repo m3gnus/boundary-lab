@@ -49,11 +49,31 @@
 # all. Same principle as the iteration floor below: put the gate against the
 # hard corner of the configuration it actually runs in.
 #
+# The capped coupling (`eta = i|k|/max(k^2, c)`, c = 1/R^2 from the body's own
+# bounding box) addresses the first mechanism and must not touch the second.
+# The final section gates exactly that, and it picks its own low frequency from
+# the mesh -- a quarter of the cap's engagement frequency -- because the
+# engagement frequency is geometry-dependent and a hard-coded low frequency
+# would be inside the capped regime on one fixture and outside it on the next.
+# Two properties are checked, and the first matters more than the second:
+#
+#  1. Inertness. Above the engagement wavenumber the capped operator is
+#     *identical* to the uncapped one, entry for entry, not merely close. That
+#     is what makes "the mid and high band are unchanged" a proof rather than a
+#     tolerance, and it is why the cap is written to evaluate `inv(|k|)` on that
+#     branch instead of the algebraically equal `|k| / k^2`.
+#  2. The iteration count below the engagement frequency does not get worse.
+#     Measured it improves -- 78 to 56 on A5 at 100 Hz, 80 to 44 on A1 -- but
+#     the gate is one-sided on purpose: the cap exists to remove a conditioning
+#     hazard, and a cap that merely fails to help is not a regression, while one
+#     that hurts is.
+#
 #   BLAB_VALIDATE_MESH_PATH   absolute mesh path (default: the bundled sample)
 #   BLAB_VALIDATE_SCALE       mesh scale (default 0.001 for the sample)
 #   BLAB_VALIDATE_SYMMETRY    off | x | xy
 #   BLAB_VALIDATE_DRIVES      independent drive columns (default 2)
 #   BLAB_VALIDATE_FREQUENCY_HZ  default 2000
+#   BLAB_BEAT_BM_COUPLING_CAP   auto (default) | off | c in 1/m^2
 using LinearAlgebra, Printf, Random
 
 include(joinpath(@__DIR__, "..", "src", "BeatEngineCore.jl"))
@@ -89,8 +109,14 @@ function validate_gmres_burton_miller()
     identity_p1_dp0 = assemble_l2_identity_matrix(mesh, p1, dp0, rule, :p1, :dp0; symmetry_mode=symmetry_mode)
 
     n = p1.global_dof_count
+    sound_speed = Float32(parse(Float64, get(ENV, "BLAB_VALIDATE_SOUND_SPEED", "343.0")))
+    body_radius = burton_miller_body_radius(mesh; symmetry_mode=symmetry_mode)
+    coupling_cap = burton_miller_coupling_cap(mesh; symmetry_mode=symmetry_mode)
+    cap_hz = coupling_cap > 0 ? sound_speed * sqrt(coupling_cap) / Float32(2pi) : 0.0f0
     println("fixture=$(mesh_path) scale=$(scale) symmetry=$(symmetry_mode)")
     println("faces=$(length(mesh.faces)) p1_dofs=$n frequencies=$(frequencies) drives=$(drive_count)")
+    @printf("body_radius=%.4f m coupling_cap=%.4f 1/m^2 (engages below %.1f Hz)\n",
+            body_radius, coupling_cap, cap_hz)
     flush(stdout)
 
     failures = String[]
@@ -125,11 +151,13 @@ function validate_gmres_burton_miller()
     println()
     println("--- $(frequency_hz) Hz ---")
     q_neumann = physical_drive(k)
+    # The shipped configuration, cap included: what is gated is what runs.
     system = assemble_burton_miller_neumann_system_cpu(
         mesh, p1, dp0, q_neumann, k, rule;
         identity_p1_p1=identity_p1_p1, identity_p1_dp0=identity_p1_dp0,
         skip_singular=false, singular_order=singular_order,
         singular_cache=singular_cache, symmetry_mode=symmetry_mode,
+        coupling_cap=coupling_cap,
     )
     matrix = system.matrix
     rhs = system.rhs
@@ -245,6 +273,92 @@ function validate_gmres_burton_miller()
                 "against $baseline for the Float64 space. The failure the remedies exist for " *
                 "is barely reachable on this host, so their agreement proves less here.")
     end
+    end
+
+    # ---------------------------------------------------------------- cap ---
+    #
+    # Everything above ran at the shipped cap. This section is about what the
+    # cap does and does not touch, and it needs the uncapped operator to say
+    # so, which is why it assembles a second time rather than reusing the loop.
+    println()
+    println("--- coupling cap ---")
+
+    # The sign is the one thing here that a solve cannot catch: both signs give
+    # a consistent, solvable system, and the wrong one costs ~900 GMRES
+    # iterations where the right one costs under 50 (Marburg). Gate it directly.
+    for probe in (0.5f0, 9.16f0, 109.9f0)
+        check(real(burton_miller_coupling(probe, coupling_cap)) == 0,
+              "coupling at k=$probe is not purely imaginary")
+        check(imag(burton_miller_coupling(probe, coupling_cap)) > 0,
+              "coupling at k=$probe has the wrong sign for e^{-i omega t}; " *
+              "eta must be +i * (positive real)")
+    end
+    check(burton_miller_coupling(9.16f0, 0) === ComplexF32(0, 1) / 9.16f0,
+          "the uncapped coupling is no longer the bare i/k, bit for bit")
+
+    if coupling_cap <= 0
+        println("cap disabled by $(BeatEngineCore.BEAT_BM_COUPLING_CAP_ENV); inertness and " *
+                "low-frequency checks skipped")
+    else
+        k_engage = sqrt(coupling_cap)
+
+        # 1. Inertness, as an identity rather than a tolerance. Checked at the
+        #    lowest gated frequency above the engagement wavenumber -- the one
+        #    closest to the transition, and so the only one where a mistake in
+        #    the branch could hide. Every frequency would cost two more full
+        #    assemblies each on a ladder-sized mesh for no more evidence.
+        inert_probes = filter(f -> Float32(2pi) * f / sound_speed >= k_engage, frequencies)
+        for frequency_hz in (isempty(inert_probes) ? Float32[] : [minimum(inert_probes)])
+            k_probe = Float32(2pi) * frequency_hz / sound_speed
+            probe_drive = physical_drive(k_probe)
+            capped = assemble_burton_miller_neumann_system_cpu(
+                mesh, p1, dp0, probe_drive, k_probe, rule;
+                identity_p1_p1=identity_p1_p1, identity_p1_dp0=identity_p1_dp0,
+                skip_singular=false, singular_order=singular_order,
+                singular_cache=singular_cache, symmetry_mode=symmetry_mode,
+                coupling_cap=coupling_cap,
+            )
+            bare = assemble_burton_miller_neumann_system_cpu(
+                mesh, p1, dp0, probe_drive, k_probe, rule;
+                identity_p1_p1=identity_p1_p1, identity_p1_dp0=identity_p1_dp0,
+                skip_singular=false, singular_order=singular_order,
+                singular_cache=singular_cache, symmetry_mode=symmetry_mode,
+                coupling_cap=0,
+            )
+            identical = capped.matrix == bare.matrix && capped.rhs == bare.rhs
+            @printf("%.0f Hz (kR=%.2f): capped operator identical to uncapped: %s\n",
+                    frequency_hz, k_probe / k_engage, identical)
+            check(identical,
+                  "$(frequency_hz) Hz is above the cap's engagement wavenumber but the capped " *
+                  "operator differs from the uncapped one; the cap is not inert in the mid band")
+        end
+
+        # 2. Below the engagement frequency the cap must not cost iterations.
+        #    The frequency is a quarter of the engagement point so that this
+        #    holds on any fixture, not only the one it was written against.
+        low_hz = 0.25f0 * cap_hz
+        k_low = Float32(2pi) * low_hz / sound_speed
+        counts = Int[]
+        for cap in (coupling_cap, 0)
+            low = assemble_burton_miller_neumann_system_cpu(
+                mesh, p1, dp0, physical_drive(k_low), k_low, rule;
+                identity_p1_p1=identity_p1_p1, identity_p1_dp0=identity_p1_dp0,
+                skip_singular=false, singular_order=singular_order,
+                singular_cache=singular_cache, symmetry_mode=symmetry_mode,
+                coupling_cap=cap,
+            )
+            x = zeros(ComplexF32, n)
+            result = beat_gmres!(x, low.matrix, Vector{ComplexF32}(view(low.rhs, :, 1));
+                                 preconditioner=beat_diagonal_preconditioner(low.matrix),
+                                 tolerance=tolerance)
+            push!(counts, result.iterations)
+            @printf("%.0f Hz cap=%-8s iterations=%d converged=%s\n",
+                    low_hz, cap == 0 ? "off" : "on", result.iterations, result.converged)
+        end
+        check(counts[1] <= counts[2],
+              "at $(low_hz) Hz the capped coupling needed $(counts[1]) iterations against " *
+              "$(counts[2]) uncapped; the cap exists to improve low-frequency conditioning, " *
+              "not to cost iterations")
     end
 
     println()

@@ -164,6 +164,64 @@ end
 
 end
 
+@testset "burton-miller coupling parameter" begin
+    # The sign, first. eta = +i * (positive real) under this engine's e^{-i w t}
+    # convention. A sign error here passes every operator-equivalence test --
+    # both signs give a consistent, solvable, wrong-conditioned system -- and
+    # Marburg measured ~900 GMRES iterations against under 50 for it. So it is
+    # gated directly rather than inferred from a solve.
+    for k in (0.5f0, 1.0f0, 12.7f0, 183.0f0)
+        @test imag(burton_miller_coupling(k, 0)) > 0
+        @test real(burton_miller_coupling(k, 0)) == 0
+    end
+
+    # Uncapped is the old expression, bit for bit, not merely to a tolerance.
+    for k in (0.1f0, 1.0f0, 9.16f0, 109.9f0, 1000.0f0)
+        @test burton_miller_coupling(k, 0) === ComplexF32(0, 1) / k
+        @test burton_miller_coupling(Float64(k), 0) === ComplexF64(0, 1) / Float64(k)
+    end
+
+    # Capped: inert above the engagement wavenumber, bounded below it.
+    radius = 0.25
+    cap = inv(radius * radius)
+    k_engage = sqrt(cap)
+    for k in (k_engage, 2 * k_engage, 37.0, 300.0)
+        @test burton_miller_coupling(k, cap) === burton_miller_coupling(k, 0)
+    end
+    for k in (1e-6, 1e-3, 0.5 * k_engage, 0.999 * k_engage)
+        scale = burton_miller_coupling_scale(k, cap)
+        @test scale < inv(k)                      # the cap is doing something
+        @test scale <= radius + 1e-12             # and it bounds |eta| by R
+        @test scale ≈ k * radius * radius
+    end
+    # Continuous at the transition, and |eta| peaks there.
+    @test burton_miller_coupling_scale(prevfloat(k_engage), cap) ≈
+        burton_miller_coupling_scale(k_engage, cap)
+    @test burton_miller_coupling_scale(k_engage, cap) ≈ radius
+    @test all(burton_miller_coupling_scale(k, cap) <= radius + 1e-12
+              for k in exp10.(range(-6, 3; length=200)))
+    # k -> 0 is finite, which is the entire point.
+    @test burton_miller_coupling_scale(0.0, cap) == 0.0
+    @test isfinite(burton_miller_coupling(1e-12, cap))
+
+    # The cap radius is the body's, not the reduced mesh's. A square plate in
+    # the x > 0 half space under :x symmetry stands for a body twice as wide.
+    vertices = [SVector(0.0f0, 0.0f0, 0.0f0), SVector(1.0f0, 0.0f0, 0.0f0),
+                SVector(1.0f0, 2.0f0, 0.0f0), SVector(0.0f0, 2.0f0, 0.0f0)]
+    faces = [(1, 2, 3), (1, 3, 4)]
+    plate = BoundaryMesh(vertices, faces, [1, 1])
+    @test burton_miller_body_radius(plate) ≈ 0.5f0 * sqrt(1.0f0^2 + 2.0f0^2)
+    @test burton_miller_body_radius(plate; symmetry_mode=:x) ≈ 0.5f0 * sqrt(2.0f0^2 + 2.0f0^2)
+    @test burton_miller_coupling_cap(plate; override="auto") ≈ inv(burton_miller_body_radius(plate)^2)
+
+    # And the override, which is what an A/B measurement drives.
+    @test burton_miller_coupling_cap(plate; override="off") == 0
+    @test burton_miller_coupling_cap(plate; override="0") == 0
+    @test burton_miller_coupling_cap(plate; override="12.5") ≈ 12.5f0
+    @test_throws ErrorException burton_miller_coupling_cap(plate; override="loud")
+    @test_throws ErrorException burton_miller_coupling_cap(plate; override="-1")
+end
+
 @testset "cpu fused Burton-Miller equals the four-operator path" begin
     # The fused exterior path forms 0.5 I - D + (i/k) H and (-S - (i/k)(K' +
     # 0.5 I)) q inside the assembly instead of combining four operators on the
