@@ -372,20 +372,70 @@ end
         #  10,230  1 drive : GMRES 1.632 vs LU 5.601   -> GMRES
         #  20,422  1 drive : GMRES 5.063 vs LU 49.30   -> GMRES
         #  20,422  4 drives: GMRES 18.32 vs LU 48.21   -> GMRES
-        @test beat_dense_solve_plan(1_974, 1).method === :lu
-        @test beat_dense_solve_plan(5_107, 1).method === :gmres
-        @test beat_dense_solve_plan(5_107, 3).method === :lu
-        @test beat_dense_solve_plan(10_230, 1).method === :gmres
-        @test beat_dense_solve_plan(20_422, 1).method === :gmres
-        @test beat_dense_solve_plan(20_422, 4).method === :gmres
-        @test beat_dense_solve_plan(20_422, 24).method === :lu
+        #
+        # Every number above is a consequence of the shipped M1 Max constants,
+        # so the overrides are cleared for the duration: these assertions are
+        # about the model at its documented calibration, not about the machine
+        # running the suite. Without this the suite fails on any correctly
+        # recalibrated host -- `scripts/calibrate_dense_solve.jl` measures 241.9
+        # GFLOP/s and a 1,789-dof crossover on a Ryzen 7 5825U, which is a right
+        # answer that turns two assertions below red.
+        overrides = (
+            BeatEngineCore.BEAT_DENSE_LU_GFLOPS_ENV,
+            BeatEngineCore.BEAT_DENSE_MATVEC_ENTRY_SECONDS_ENV,
+            BeatEngineCore.BEAT_DENSE_MATVEC_DOF_SECONDS_ENV,
+            BeatEngineCore.BEAT_DENSE_TRIANGULAR_GBPS_ENV,
+            BeatEngineCore.BEAT_GMRES_MODEL_ITERATIONS_ENV,
+        )
+        withenv((name => nothing for name in overrides)...) do
+            @test beat_dense_solve_plan(1_974, 1).method === :lu
+            @test beat_dense_solve_plan(5_107, 1).method === :gmres
+            @test beat_dense_solve_plan(5_107, 3).method === :lu
+            @test beat_dense_solve_plan(10_230, 1).method === :gmres
+            @test beat_dense_solve_plan(20_422, 1).method === :gmres
+            @test beat_dense_solve_plan(20_422, 4).method === :gmres
+            @test beat_dense_solve_plan(20_422, 24).method === :lu
 
-        # More drives always pushes the crossover up, never down.
+            # Independently measured between 2,000 and 5,000 dofs at one drive.
+            @test beat_dense_solve_crossover_dofs(1) > 2_000
+            @test beat_dense_solve_crossover_dofs(1) < 5_000
+        end
+
+        # Machine-independent: more drives always pushes the crossover up,
+        # never down, whatever the constants say. This one is deliberately
+        # outside the block above.
         crossovers = [beat_dense_solve_crossover_dofs(drives) for drives in 1:6]
         @test issorted(crossovers)
-        # Independently measured between 2,000 and 5,000 dofs at one drive.
-        @test beat_dense_solve_crossover_dofs(1) > 2_000
-        @test beat_dense_solve_crossover_dofs(1) < 5_000
+    end
+
+    @testset "iteration budget bounds a misrouted GMRES" begin
+        # The budget is one LU's worth of matvecs, so a GMRES that exhausts it
+        # and falls back costs at most twice the direct solve. Without it the
+        # cap is min(n, 1000) and the loss is unbounded: measured 3.85x at
+        # 4,751 dofs and 6 kHz, where the true iteration count is 429 against
+        # the model's assumed 70.
+        for (dofs, drives) in ((5_107, 1), (10_230, 1), (20_422, 4))
+            budget = beat_gmres_iteration_budget(dofs, drives)
+            spent = budget * beat_dense_matvec_seconds(dofs)
+            @test spent <= beat_dense_lu_seconds(dofs, drives) * 1.01
+        end
+
+        # It has to leave room for the solves the model expects to win, or the
+        # router would choose GMRES and then forbid it from finishing.
+        for (dofs, drives) in ((5_107, 1), (10_230, 1), (20_422, 1))
+            plan = beat_dense_solve_plan(dofs, drives)
+            plan.method === :gmres || continue
+            @test beat_gmres_iteration_budget(dofs, drives) >
+                  BeatEngineCore.BEAT_GMRES_MODEL_ITERATIONS_DEFAULT
+        end
+
+        # The budget is a total across drives, so it rises with drive count --
+        # but only by the triangular solves, never by the factorization, which
+        # is shared. The share each drive gets therefore falls, which is the
+        # same asymmetry the router weighs.
+        totals = [beat_gmres_iteration_budget(10_230, drives) for drives in 1:6]
+        @test issorted(totals)
+        @test issorted([total / drives for (drives, total) in enumerate(totals)]; rev=true)
     end
 
     @testset "explicit override beats the model" begin
