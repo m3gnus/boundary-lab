@@ -37,17 +37,27 @@
 #  * Low-k conditioning. The uncapped Burton-Miller coupling `eta = i/k` grows
 #    without bound as k goes to zero, so the bottom of the band is hard. This
 #    dominates on well-resolved meshes: on the ATH ladder's A5 (5,107 dofs) the
-#    counts are 70 / 51 / 51 at 500 / 2000 / 6000 Hz.
+#    counts fall monotonically across the band.
 #  * High kh. A coarse mesh runs out of elements per wavelength, so the top of
-#    the band is hard. This dominates here: on the bundled 1,390-dof sample the
-#    counts are 44 / 51 / 63 over the same frequencies -- the opposite ordering.
+#    the band is hard, which pulls the other way.
 #
-# So 6 kHz is this fixture's hard corner and 500 Hz is the ladder's. A gate at
-# mid-band alone would pass straight through either. Guarding the low-k
+# Which end is hard is therefore a property of the mesh, and a gate at mid-band
+# alone would pass straight through either mechanism. Guarding the low-k
 # coupling path specifically needs a ladder-sized mesh via
 # BLAB_VALIDATE_MESH_PATH; the bundled fixture cannot exhibit that failure at
 # all. Same principle as the iteration floor below: put the gate against the
 # hard corner of the configuration it actually runs in.
+#
+# The counts this paragraph used to quote -- 44 / 51 / 63 on the bundled sample
+# and 70 / 51 / 51 on A5 -- were measured before `8aa2539`, with the random
+# right-hand side this gate no longer uses. On the physical drive the bundled
+# sample reads 53 / 58 / 55 at 500 / 2000 / 6000 Hz, which is not the same
+# ordering, so the old numbers did not merely shift. **Never quote an iteration
+# count without the drive that produced it.** The random-versus-physical gap is
+# about 1.6x on these meshes and it misled three sessions in one day, including
+# by surviving a rebase inside a single branch: the number was written down
+# under one drive and read back under another with nothing in its appearance
+# changed.
 #
 # The capped coupling (`eta = i|k|/max(k^2, c)`, c = 1/R^2 from the body's own
 # bounding box) addresses the first mechanism and must not touch the second.
