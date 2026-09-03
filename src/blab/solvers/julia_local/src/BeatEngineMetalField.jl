@@ -147,6 +147,117 @@ function _metal_field_eval_entries_kernel!(
     return nothing
 end
 
+"""
+    _metal_field_chunk_count(point_count, source_count)
+
+How many source chunks to split each evaluation point across.
+
+The one-thread-per-point kernel below is correct but launches `point_count`
+threads, and a polar sweep asks for very few points -- two 37-angle cuts is 74.
+That leaves an M-series GPU almost entirely idle while each thread walks the
+whole source list, so the stage costs far more than its arithmetic. Splitting
+the source loop across `chunks` threads per point and summing the partials
+restores the occupancy. Returns 1 when the point count already fills the
+machine, in which case the original single-pass kernel runs unchanged.
+"""
+const BEAT_METAL_FIELD_CHUNKS_ENV = "BLAB_METAL_FIELD_CHUNKS"
+
+@inline function _metal_field_chunk_count(point_count::Int, source_count::Int)
+    target_threads = 16384
+    override = get(ENV, BEAT_METAL_FIELD_CHUNKS_ENV, "auto")
+    if override != "auto"
+        requested = tryparse(Int, override)
+        requested === nothing && error(
+            "$(BEAT_METAL_FIELD_CHUNKS_ENV) must be auto or a positive integer; got $(override).")
+        return max(1, requested)
+    end
+    point_count >= target_threads && return 1
+    source_count <= 0 && return 1
+    # Keep enough sources per thread that the loop still amortises its setup.
+    max_by_source = max(1, source_count ÷ 64)
+    return clamp(cld(target_threads, point_count), 1, max_by_source)
+end
+
+function _metal_field_eval_chunked_kernel!(
+    partials,
+    eval_points,
+    source_points,
+    source_normals,
+    weighted_pressure,
+    weighted_neumann,
+    k,
+    source_count,
+    point_count,
+    chunk_length,
+    chunk_count,
+)
+    linear_index = _metal_global_linear_index()
+    linear_index > point_count * chunk_count && return nothing
+    # Point-major within each chunk block: neighbouring threads read
+    # neighbouring evaluation points, and every thread in a chunk walks the
+    # same source range, so the source reads broadcast.
+    point_index = (linear_index - 1) % point_count + 1
+    chunk_index = (linear_index - 1) ÷ point_count
+    source_start = chunk_index * chunk_length + 1
+    source_start > source_count && return nothing
+    source_stop = min(source_count, source_start + chunk_length - 1)
+    four_pi = typeof(k)(12.566370614359172)
+    x1 = eval_points[point_index]
+    x2 = eval_points[point_index + point_count]
+    x3 = eval_points[point_index + 2 * point_count]
+    potential_re = zero(k)
+    potential_im = zero(k)
+    source_index = source_start
+    while source_index <= source_stop
+        r1 = source_points[source_index] - x1
+        r2 = source_points[source_index + source_count] - x2
+        r3 = source_points[source_index + 2 * source_count] - x3
+        radius2 = r1 * r1 + r2 * r2 + r3 * r3
+        if radius2 > zero(k)
+            radius = sqrt(radius2)
+            inv_radius = one(k) / radius
+            phase = k * radius
+            green_scale = inv_radius / four_pi
+            green_re = cos(phase) * green_scale
+            green_im = sin(phase) * green_scale
+            normal_projection = (
+                r1 * source_normals[source_index] +
+                r2 * source_normals[source_index + source_count] +
+                r3 * source_normals[source_index + 2 * source_count]
+            ) * inv_radius
+            double_re = (-green_re * inv_radius - green_im * k) * normal_projection
+            double_im = (green_re * k - green_im * inv_radius) * normal_projection
+            p = weighted_pressure[source_index]
+            q = weighted_neumann[source_index]
+            p_re = real(p)
+            p_im = imag(p)
+            q_re = real(q)
+            q_im = imag(q)
+            potential_re += double_re * p_re - double_im * p_im - green_re * q_re + green_im * q_im
+            potential_im += double_re * p_im + double_im * p_re - green_re * q_im - green_im * q_re
+        end
+        source_index += 1
+    end
+    partials[linear_index] = Complex(potential_re, potential_im)
+    return nothing
+end
+
+function _metal_field_reduce_partials_kernel!(potentials, partials, point_count, chunk_count)
+    point_index = _metal_global_linear_index()
+    point_index > point_count && return nothing
+    total_re = zero(real(eltype(partials)))
+    total_im = zero(real(eltype(partials)))
+    chunk_index = 0
+    while chunk_index < chunk_count
+        value = partials[point_index + chunk_index * point_count]
+        total_re += real(value)
+        total_im += imag(value)
+        chunk_index += 1
+    end
+    potentials[point_index] = Complex(total_re, total_im)
+    return nothing
+end
+
 function evaluate_galerkin_field_metal(
     eval_points,
     mesh::BoundaryMesh{T},
@@ -182,20 +293,52 @@ function evaluate_galerkin_field_metal(
         cache.source_count;
         groupsize=groupsize,
     )
-    _metal_launch(
-        _metal_field_eval_entries_kernel!,
-        point_count,
-        d_potentials,
-        d_eval_points,
-        cache.source_points,
-        cache.source_normals,
-        d_weighted_pressure,
-        d_weighted_neumann,
-        k,
-        cache.source_count,
-        point_count;
-        groupsize=groupsize,
-    )
+    chunk_count = _metal_field_chunk_count(point_count, cache.source_count)
+    d_partials = nothing
+    if chunk_count == 1
+        _metal_launch(
+            _metal_field_eval_entries_kernel!,
+            point_count,
+            d_potentials,
+            d_eval_points,
+            cache.source_points,
+            cache.source_normals,
+            d_weighted_pressure,
+            d_weighted_neumann,
+            k,
+            cache.source_count,
+            point_count;
+            groupsize=groupsize,
+        )
+    else
+        chunk_length = cld(cache.source_count, chunk_count)
+        d_partials = Metal.zeros(Complex{T}, point_count * chunk_count)
+        _metal_launch(
+            _metal_field_eval_chunked_kernel!,
+            point_count * chunk_count,
+            d_partials,
+            d_eval_points,
+            cache.source_points,
+            cache.source_normals,
+            d_weighted_pressure,
+            d_weighted_neumann,
+            k,
+            cache.source_count,
+            point_count,
+            chunk_length,
+            chunk_count;
+            groupsize=groupsize,
+        )
+        _metal_launch(
+            _metal_field_reduce_partials_kernel!,
+            point_count,
+            d_potentials,
+            d_partials,
+            point_count,
+            chunk_count;
+            groupsize=groupsize,
+        )
+    end
     Metal.synchronize()
     result = return_device ? d_potentials : Complex{T}.(Array(d_potentials))
     Metal.unsafe_free!(d_eval_points)
@@ -203,6 +346,7 @@ function evaluate_galerkin_field_metal(
     neumann_on_device || Metal.unsafe_free!(d_neumann)
     Metal.unsafe_free!(d_weighted_pressure)
     Metal.unsafe_free!(d_weighted_neumann)
+    d_partials === nothing || Metal.unsafe_free!(d_partials)
     return_device || Metal.unsafe_free!(d_potentials)
     return result
 end
