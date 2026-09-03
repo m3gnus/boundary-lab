@@ -158,9 +158,63 @@ assembles one operator with 18 atomics per pair, takes 0.42 s on the same
 mesh.
 
 A frequency sweep overlaps the GPU assembly of frequency i+1 with the CPU
-factorization of frequency i on a second Julia thread
-(`BLAB_METAL_PIPELINE=0` disables it); two operator sets are then resident
-at once.
+factorization of frequency i on a second Julia thread; two operator sets are
+then resident at once.
+
+The overlap is not free, and it does not always pay. What it buys is the CPU
+solve it hides, which grows as O(N^3) against the assembly's O(N^2). What it
+costs is GPU-side: one assembly already saturates the device, so dispatching
+the next one from a spawned task while this frequency's field evaluation is
+still running does not find idle silicon, it interleaves two command queues
+over the same units. Below a mesh size that costs more than the hidden solve is
+worth, so the sweep decides per solve, from the dof count: see
+`METAL_PIPELINE_MIN_DOFS` in `BeatEngineDriver.jl`.
+
+Per frequency on the 1,209-dof quarter, overlapping slows the assembly by 30 ms
+and the field evaluation by 105 ms, and costs the CPU solve a further 10 ms for
+the core the spawned task takes; the same GPU work measures 2.82 s sequentially
+against 5.53 s split across two tasks. On the 4,552-dof full model the GPU work
+goes 8.11 s to 10.11 s, which the larger CPU solve more than pays for.
+
+**It is not the command-queue construction, despite the obvious suspicion.**
+Metal.jl keeps its queue in task-local storage, so a spawned task does build its
+own each frequency, but measured directly that is a fixed 0.23-0.29 ms per task
+and does not grow with the number of kernels the task dispatches -- two orders
+of magnitude below the penalty above. A persistent assembly task holding one
+queue would therefore recover almost none of it. This is the same result the
+cross-frequency concurrency probes reached from the other direction: concurrent
+assemblies measure slower than sequential ones because one assembly is already
+enough to fill the GPU.
+
+Measured on an M1 Max, 20 frequencies from 100 Hz to 20 kHz, minimum of four
+interleaved rounds, as the ratio of sequential to pipelined wall clock:
+
+| mesh | P1 dofs | symmetry | pipelining |
+|---|---:|---|---:|
+| ATH `asro68` quarter | 1,209 | `xy` | 0.96x |
+| ATH ladder A1 | 1,974 | off | 1.13x |
+| ATH ladder A2 | 2,559 | off | 1.19x |
+| ATH ladder A3 | 3,898 | off | 1.28x |
+| `asro68` full | 4,552 | off | **1.38x** |
+| `asro68` quarter, subdivided | 4,692 | `xy` | 1.11x |
+| ATH ladder A5 | 5,107 | off | 1.30x |
+
+The crossover was then pinned with six spheres filling the gap the waveguide
+ladder leaves, in a second run of five rounds: 1,202 dofs 0.82x, 1,514 0.97x,
+1,742 0.96x, 1,986 1.13x, 2,382 1.22x, 3,122 1.19x. The two families agree
+where they overlap -- the 1,986-dof sphere's 1.13x against the 1,974-dof
+waveguide's 1.13x -- so the crossover is between 1,742 and 1,986 dofs and the
+default sits at 1,900.
+
+Two things that table is evidence for. The threshold can be expressed in dofs
+alone: the subdivided quarter wins at 4,692 dofs with two mirror planes, so a
+symmetry mode that quadruples the assembly does not move the sign, and the rule
+needs to know nothing about images. And the constant is a machine constant, not
+a physical one -- a GPU with a cheaper queue rebuild, or a slower dense solve,
+puts it somewhere else.
+
+`BLAB_METAL_PIPELINE` overrides it in both directions, and each frequency's
+`metal_pipeline` diagnostic reports which way the choice went.
 
 ## Requirements
 
@@ -201,7 +255,7 @@ Normal application use does not require these environment variables.
 | `BLAB_METAL_GATHER_TIMING` | `0` | Set to `1` to synchronize after each `pair_gather` stage and report `metal_native_gather_*` timings (slower). |
 | `BLAB_METAL_SINGULAR_PARTS` | `4` | Ranges each singular pair's Duffy rule is split into across threads. |
 | `BLAB_METAL_OPERATOR_STORAGE` | `shared` | Use `private` to allocate the operator matrices in private storage and copy them to the host, the pre-2026-09-02 behavior. |
-| `BLAB_METAL_PIPELINE` | `1` | Set to `0` to assemble and solve each sweep frequency sequentially instead of overlapping GPU assembly with the CPU factorization. |
+| `BLAB_METAL_PIPELINE` | by dof count | Overlaps the next frequency's GPU assembly with this frequency's CPU factorization. Unset, the sweep decides per solve from the mesh size (`METAL_PIPELINE_MIN_DOFS`); `0` forces sequential, anything else forces the overlap. |
 | `BLAB_METAL_ATOMIC_SCATTER` | `1` | Diagnostic for `pair_atomic` only: `0` skips the atomic scatter to time the pair arithmetic (the operators are then wrong). |
 | `BLAB_BEAT_FUSED_BM` | `1` | Set to `0` to assemble the four operators and combine them on the host for exterior solves. Coupled solves, `host_staged` assembly and the `host` singular mode always take the four-operator path. |
 
