@@ -408,6 +408,50 @@ end
         @test issorted(crossovers)
     end
 
+    @testset "wall-clock ceiling stops a run the iteration budget cannot" begin
+        # The iteration budget bounds matvecs, not time. Orthogonalization is
+        # O(m^2 N) and overtakes the matvec inside the budget's own range --
+        # measured at 10,230 dofs, 385 iterations cost 32.8 s against 11.1 s of
+        # matvec -- so only a clock can bound the damage.
+        n = 300
+        eigenvalues = ComplexF32[ComplexF32(1.05) + cis(Float32(2pi * i / n)) for i in 1:n]
+        matrix = Matrix{ComplexF32}(Diagonal(eigenvalues))
+        for row in 1:n, column in (row + 1):n
+            matrix[row, column] += ComplexF32(cos(0.7f0 * row), sin(0.3f0 * column)) *
+                                   0.5f0 / sqrt(Float32(n))
+        end
+        rhs = ComplexF32[ComplexF32(sin(0.2f0 * row), cos(0.11f0 * row)) for row in 1:n]
+
+        # An unreachable tolerance runs until something else stops it. That
+        # count is a property of the operator, not a number to hard-code -- it
+        # is read here so the assertions below compare against it.
+        solve(; kwargs...) = beat_gmres!(zeros(ComplexF32, n), matrix, copy(rhs);
+                                         max_iterations=250, tolerance=1e-30,
+                                         restart=0, kwargs...)
+        natural = solve()
+        elapsed = @elapsed solve()
+        bounded = solve(deadline_seconds=elapsed / 4)
+        @test natural.iterations > 20
+        @test bounded.iterations < natural.iterations
+        @test bounded.converged == false
+
+        # Zero and negative mean no limit, so the default path is untouched.
+        for none in (0, -1.0)
+            @test solve(deadline_seconds=none).iterations == natural.iterations
+        end
+
+        # The cycle's solution update must happen before the timeout breaks out,
+        # not after: leaving early without it hands back the zero iterate and
+        # throws away every iteration that was paid for. Asserting the residual
+        # improves would be wrong -- GMRES minimizes the *preconditioned*
+        # residual, so the true one can rise early -- but the iterate must at
+        # least have been written.
+        x = zeros(ComplexF32, n)
+        beat_gmres!(x, matrix, copy(rhs); max_iterations=250, tolerance=1e-30,
+                    restart=0, deadline_seconds=elapsed / 4)
+        @test any(!iszero, x)
+    end
+
     @testset "iteration budget bounds a misrouted GMRES" begin
         # The budget is one LU's worth of matvecs, so a GMRES that exhausts it
         # and falls back costs at most twice the direct solve. Without it the
