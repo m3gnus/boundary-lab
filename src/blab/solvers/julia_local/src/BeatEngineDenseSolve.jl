@@ -197,9 +197,9 @@ end
     beat_gmres_seconds(n, drive_count)
 
 Modelled GMRES seconds: one matvec per iteration, every iteration, for every
-drive. Arnoldi orthogonalization is deliberately not modelled -- at 210
-iterations and 20,422 dofs the Krylov basis is 34 MB against a 3.3 GB matrix,
-so it is under 1% of the traffic.
+drive. Arnoldi orthogonalization is deliberately not modelled because this is
+a routing estimate, but its time is not negligible: the wall-clock deadline
+below is the guard that bounds a stale estimate.
 """
 function beat_gmres_seconds(n::Integer, drive_count::Integer=1)
     n <= 0 && return 0.0
@@ -207,17 +207,55 @@ function beat_gmres_seconds(n::Integer, drive_count::Integer=1)
     return max(1, drive_count) * iterations * beat_dense_matvec_seconds(n)
 end
 
-"""How much LU-equivalent work a model-chosen GMRES may spend before it stops.
+"""How many LU-equivalents of *matvec* a model-chosen GMRES may spend.
 
 One is the value that makes the argument: at a budget of one LU, a GMRES that
-exhausts it and falls back has cost one LU of matvecs plus the factorization it
-should have done, so the worst case is bounded at twice the direct solve. The
-knob exists because that bound trades against false abandons -- a run that
-would have converged a few iterations past the budget is stopped at 2x when it
-would have finished near 1.2x -- and the balance is a property of how heavy the
-operator's tail is, which differs by mesh family."""
+exhausts it has spent one LU of matvecs, so it has provably lost and the
+remaining work belongs on the factorization.
+
+This bounds matvecs, **not** wall clock, and the gap between those is not
+small. An iteration also orthogonalizes against `j` prior vectors, and that
+term is `O(m^2 N)` with a large constant: modified Gram-Schmidt is a sequence
+of `j` separate BLAS-1 passes over an N-vector, which parallelize far worse
+than the matvec's GEMV. Measured here at 10,230 dofs, where the budget allows
+385 iterations:
+
+    m      GMRES     385-matvec share   overhead   ortho per iteration
+    50     2.42 s          1.45 s        +67%           19.5 ms
+    100    5.94 s          2.90 s       +105%           30.4 ms
+    200   18.45 s          5.79 s       +219%           63.3 ms
+    385   32.80 s         11.15 s       +194%           56.3 ms
+
+against a 28.9 ms matvec -- so by the end orthogonalization costs twice what
+the matvec does. The traffic argument that this is negligible (a 63 MB basis
+against an 837 MB matrix) is correct about bytes and wrong about time, because
+the basis is re-read every iteration and the cost is call overhead and lost
+parallelism rather than bandwidth.
+
+So the matvec budget alone leaves the worst case growing with N: 2.06x at
+4,554 dofs but 5.12x at 10,230. `BEAT_GMRES_TIME_CEILING` is what actually
+bounds it; this factor stays because "one LU of matvecs" is the statement that
+GMRES has provably lost, which is worth keeping separate from the wall-clock
+guard."""
 const BEAT_GMRES_BUDGET_FACTOR_ENV = "BLAB_BEAT_GMRES_BUDGET"
 const BEAT_GMRES_BUDGET_FACTOR_DEFAULT = 1.0
+
+"""Wall-clock ceiling for a model-chosen GMRES, in modelled-LU multiples.
+
+The matvec budget above cannot bound time, so this does. Two is deliberately
+loose rather than tight: the modelled LU underestimates the real one wherever
+the constants are stale -- 0.534 s modelled against 0.817 s measured at 4,554
+dofs on the reference host -- and a ceiling of one LU would then abandon solves
+that are still winning. At two, every GMRES that currently wins on the ATH and
+ASRO meshes finishes untouched (the slowest, 101 iterations at 7 kHz, takes
+0.65 s against a 1.07 s ceiling), while the 10,230-dof blowup is cut from
+32.8 s to 12.0 s and the worst case from 5.12x to about 2.5x.
+
+Recalibrating shrinks the gap this factor exists to cover: with constants
+refitted for the host the modelled LU rises toward the real one, and the
+ceiling tightens with it at no extra risk."""
+const BEAT_GMRES_TIME_CEILING_ENV = "BLAB_BEAT_GMRES_TIME_CEILING"
+const BEAT_GMRES_TIME_CEILING_DEFAULT = 2.0
 
 """
     beat_gmres_iteration_budget(n, drive_count)
@@ -234,9 +272,9 @@ iteration cap set to `min(n, 1000)` the resulting loss is unbounded: at 4,751
 dofs and 6 kHz a GMRES the router picked spent 429 iterations to beat a 0.88 s
 factorization in 3.40 s.
 
-The budget converts that into a bounded one. Exceeding it is not a failure to
-be retried but the discovery that the routing decision was wrong, and the
-correct response to that discovery is the LU. It applies only when the model
+The budget bounds that matvec loss. Exceeding it is not a failure to be retried
+but the discovery that the routing decision was wrong, and the correct response
+to that discovery is the LU. It applies only when the model
 chose GMRES: an explicit `BLAB_BEAT_DENSE_SOLVE=gmres` is an instruction, and
 benchmarking the Krylov path against the direct one needs it to run to the end.
 """
@@ -369,6 +407,7 @@ struct BeatGmresResult{T<:AbstractFloat}
     converged::Bool
     iterations::Int
     relative_residual::T
+    reason::Symbol
 end
 
 function beat_gmres_krylov_type(override::AbstractString=get(ENV, BEAT_GMRES_KRYLOV_PRECISION_ENV, "f64"))
@@ -387,12 +426,26 @@ function beat_gmres_reorthogonalization(override::AbstractString=get(ENV, BEAT_G
 end
 
 """
-    beat_gmres!(x, matrix, b; tolerance, max_iterations, restart, preconditioner)
+    beat_gmres!(x, matrix, b; tolerance, max_iterations, restart, preconditioner,
+                deadline_seconds, deadline_ns, clock_ns)
 
 Solve `matrix * x = b` in place. Left diagonal preconditioning is applied
 internally; `tolerance` is on the true relative residual `||b - A x|| / ||b||`,
 which is verified against the operator rather than trusted from the Givens
 recursion.
+
+`deadline_seconds` stops the run once that much wall clock has elapsed, zero or
+negative meaning no limit. It exists because `max_iterations` cannot bound
+time: the per-iteration orthogonalization grows with the iteration index and
+overtakes the matvec well inside the useful range (see
+`BEAT_GMRES_TIME_CEILING`). The partial solution is kept -- the caller verifies
+the true residual and may find it converged anyway.
+
+`deadline_ns` is an absolute deadline from Julia's monotonic `time_ns()` clock.
+It takes precedence over `deadline_seconds` and lets a caller share one deadline
+across multiple drives rather than restarting the clock for each one.
+`clock_ns` defaults to that monotonic clock and is injectable so the partial-
+iterate deadline invariant can be tested without relying on scheduler timing.
 
 Returns a `BeatGmresResult`. A non-converged result is a fact to act on, not
 an error: the caller falls back to the dense LU.
@@ -405,7 +458,18 @@ function beat_gmres!(x::AbstractVector{Complex{T}},
                      restart::Integer=_beat_gmres_restart(),
                      krylov_type::Type=beat_gmres_krylov_type(),
                      reorthogonalize::Symbol=beat_gmres_reorthogonalization(),
-                     preconditioner::Union{Nothing,AbstractVector{Complex{T}}}=nothing) where {T<:AbstractFloat}
+                     preconditioner::Union{Nothing,AbstractVector{Complex{T}}}=nothing,
+                     deadline_seconds::Real=0,
+                     deadline_ns::Integer=0,
+                     clock_ns::F=time_ns) where {T<:AbstractFloat,F}
+    wall_deadline_ns = if deadline_ns > 0
+        UInt64(deadline_ns)
+    elseif deadline_seconds > 0
+        clock_ns() + UInt64(max(1, round(Int, deadline_seconds * 1e9)))
+    else
+        UInt64(0)
+    end
+    out_of_time = false
     n = size(matrix, 1)
     size(matrix, 2) == n || error("beat_gmres! needs a square system; got $(size(matrix)).")
     length(b) == n || error("beat_gmres! right-hand side must have $n rows; got $(length(b)).")
@@ -419,7 +483,7 @@ function beat_gmres!(x::AbstractVector{Complex{T}},
     b_norm = norm(b)
     if b_norm == 0
         fill!(x, zero(Complex{T}))
-        return BeatGmresResult{T}(true, 0, zero(T))
+        return BeatGmresResult{T}(true, 0, zero(T), :converged)
     end
     preconditioned_b_norm = norm(b .* inverse_diagonal)
     preconditioned_b_norm == 0 && (preconditioned_b_norm = b_norm)
@@ -438,14 +502,17 @@ function beat_gmres!(x::AbstractVector{Complex{T}},
         copyto!(residual, b)
         mul!(residual, matrix, x, -one(Complex{T}), one(Complex{T}))
         relative = T(norm(residual) / b_norm)
-        relative <= tol && return BeatGmresResult{T}(true, total_iterations, relative)
+        relative <= tol && return BeatGmresResult{T}(true, total_iterations, relative, :converged)
+        if wall_deadline_ns > 0 && clock_ns() >= wall_deadline_ns
+            return BeatGmresResult{T}(false, total_iterations, relative, :deadline)
+        end
         # A cycle that does not materially reduce the true residual will not
         # be rescued by another one. Without this, an unreachable tolerance --
         # and in Float32 the true residual floors out somewhere near
         # sqrt(N) * eps -- burns the entire iteration budget before the caller
         # gets its answer from the LU. Report the stall promptly instead.
         if relative > previous_relative * T(BEAT_GMRES_STAGNATION_FACTOR)
-            return BeatGmresResult{T}(false, total_iterations, relative)
+            return BeatGmresResult{T}(false, total_iterations, relative, :stagnated)
         end
         previous_relative = relative
 
@@ -455,7 +522,7 @@ function beat_gmres!(x::AbstractVector{Complex{T}},
             work[index] = W(residual[index])
         end
         beta = norm(work)
-        beta == 0 && return BeatGmresResult{T}(true, total_iterations, relative)
+        beta == 0 && return BeatGmresResult{T}(true, total_iterations, relative, :converged)
         basis[1] .= work ./ beta
 
         # The Krylov space cannot exceed the dimension of the problem, so
@@ -495,15 +562,30 @@ function beat_gmres!(x::AbstractVector{Complex{T}},
             total_iterations += 1
             abs(rhs_small[j + 1]) <= inner_target && break
             subdiagonal <= breakdown_floor && break
+            # One clock read against a matvec that costs milliseconds. The
+            # check has to be here rather than between restart cycles: the
+            # default is unrestarted, so a cycle is the whole solve and a
+            # per-cycle check would never fire.
+            if wall_deadline_ns > 0 && clock_ns() >= wall_deadline_ns
+                out_of_time = true
+                break
+            end
         end
-
+        # After the update, never before it: the Krylov solution for this cycle
+        # is only written into `x` here, and leaving on the timeout without it
+        # would hand back the zero iterate and call the partial work wasted
+        # when it is not -- the caller verifies the true residual and may still
+        # find it converged.
         _beat_gmres_update!(x, basis, hessenberg, rhs_small, used)
+        out_of_time && break
     end
 
     copyto!(residual, b)
     mul!(residual, matrix, x, -one(Complex{T}), one(Complex{T}))
     relative = T(norm(residual) / b_norm)
-    return BeatGmresResult{T}(relative <= tol, total_iterations, relative)
+    converged = relative <= tol
+    reason = converged ? :converged : out_of_time ? :deadline : :iteration_limit
+    return BeatGmresResult{T}(converged, total_iterations, relative, reason)
 end
 
 # M^-1 A v, with the matvec at the operator's precision and the result handed
@@ -727,8 +809,8 @@ diagonally preconditioned GMRES by cost model, and falling back from GMRES to
 the LU if any drive fails to converge.
 
 Returns `(solution, report)`. The report carries the plan, the method actually
-used, per-drive iteration counts and relative residuals, and `fell_back` when
-GMRES was chosen and did not deliver.
+used, per-drive iteration counts, residuals and termination reasons, and
+`fell_back` plus `fallback_reason` when GMRES was chosen and did not deliver.
 
 `preserve_matrix` is true because the fused Metal path hands over a shared
 device buffer the caller still owns; `lu!` would overwrite it. GMRES never
@@ -750,25 +832,53 @@ function beat_solve_dense_system(matrix::AbstractMatrix{Complex{T}},
         inverse_diagonal = beat_diagonal_preconditioner(matrix)
         iterations = Int[]
         residuals = T[]
+        termination_reasons = Symbol[]
         converged = true
+        fallback_reason = nothing
         # A model-chosen GMRES gets one LU's worth of matvecs across every
         # drive; an explicitly requested one is left alone. `ceiling` is the
         # hard stall guard and still applies.
         ceiling = _beat_gmres_max_iterations(n)
         remaining = plan.reason === :model ?
                     beat_gmres_iteration_budget(n, drive_count) : typemax(Int)
+        # Both budgets are totals shared across drives, and both apply only to
+        # a model-chosen run. The matvec one says GMRES has provably lost; the
+        # wall-clock one is what actually bounds the damage, because the
+        # orthogonalization the matvec count ignores overtakes the matvec.
+        time_allowance = plan.reason === :model ?
+                         _beat_env_float(BEAT_GMRES_TIME_CEILING_ENV, BEAT_GMRES_TIME_CEILING_DEFAULT) *
+                         beat_dense_lu_seconds(n, drive_count) : 0.0
+        deadline_ns = time_allowance > 0 ?
+                      time_ns() + UInt64(max(1, round(Int, time_allowance * 1e9))) : UInt64(0)
         gmres_elapsed = @elapsed for drive in 1:drive_count
+            if plan.reason === :model && remaining <= 0
+                converged = false
+                fallback_reason = :iteration_budget
+                break
+            end
+            if deadline_ns > 0 && time_ns() >= deadline_ns
+                converged = false
+                fallback_reason = :deadline
+                break
+            end
             column = view(solution, :, drive)
+            drive_budget = min(ceiling, remaining)
+            shared_budget_limited = plan.reason === :model && remaining <= ceiling
             result = beat_gmres!(column, matrix, Vector{Complex{T}}(view(rhs_matrix, :, drive));
                                  preconditioner=inverse_diagonal,
-                                 max_iterations=min(ceiling, max(remaining, 1)))
+                                 max_iterations=drive_budget,
+                                 deadline_ns=deadline_ns)
             push!(iterations, result.iterations)
             push!(residuals, result.relative_residual)
+            push!(termination_reasons, result.reason)
             remaining -= result.iterations
             if !result.converged
                 # The fallback re-solves every column against one factorization,
                 # so any Krylov work on the remaining drives would be discarded.
                 converged = false
+                fallback_reason = result.reason === :iteration_limit &&
+                                  shared_budget_limited ?
+                                  :iteration_budget : result.reason
                 break
             end
         end
@@ -777,21 +887,25 @@ function beat_solve_dense_system(matrix::AbstractMatrix{Complex{T}},
                 plan=plan,
                 method=:gmres,
                 fell_back=false,
+                fallback_reason=nothing,
                 iterations=iterations,
                 relative_residuals=residuals,
+                termination_reasons=termination_reasons,
                 seconds=gmres_elapsed,
             )
         end
         # Non-convergence is reported, never raised. The dense LU always
         # answers on this operator, and a slower correct solve beats a crash.
-        @warn "BEAT GMRES did not converge; falling back to the dense LU." dofs = n drives = drive_count iterations = iterations relative_residuals = residuals
+        @warn "BEAT GMRES stopped; falling back to the dense LU." dofs = n drives = drive_count reason = fallback_reason iterations = iterations relative_residuals = residuals
         lu_solution, lu_elapsed = _beat_dense_lu_solve(matrix, rhs_matrix, preserve_matrix)
         return lu_solution, (
             plan=plan,
             method=:lu,
             fell_back=true,
+            fallback_reason=fallback_reason,
             iterations=iterations,
             relative_residuals=residuals,
+            termination_reasons=termination_reasons,
             seconds=gmres_elapsed + lu_elapsed,
         )
     end
@@ -801,8 +915,10 @@ function beat_solve_dense_system(matrix::AbstractMatrix{Complex{T}},
         plan=plan,
         method=:lu,
         fell_back=false,
+        fallback_reason=nothing,
         iterations=Int[],
         relative_residuals=T[],
+        termination_reasons=Symbol[],
         seconds=elapsed,
     )
 end
@@ -836,7 +952,18 @@ function describe_dense_solve(report)
     if report.fell_back
         iterations = isempty(report.iterations) ? 0 : maximum(report.iterations)
         residual = isempty(report.relative_residuals) ? 0.0 : maximum(report.relative_residuals)
-        return "Julia direct dense solve after GMRES failed to converge " *
+        reason = if report.fallback_reason === :deadline
+            "reached its shared wall-clock deadline"
+        elseif report.fallback_reason === :iteration_budget
+            "exhausted its shared iteration budget"
+        elseif report.fallback_reason === :iteration_limit
+            "reached its per-drive iteration limit"
+        elseif report.fallback_reason === :stagnated
+            "stagnated"
+        else
+            "failed to converge"
+        end
+        return "Julia direct dense solve after GMRES $reason " *
             "($iterations iterations, relative residual $(round(residual; sigdigits=3))): " *
             "$(plan.dofs) dofs, $(plan.drives) drive(s)"
     end

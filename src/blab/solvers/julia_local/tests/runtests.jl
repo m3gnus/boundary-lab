@@ -408,10 +408,61 @@ end
         @test issorted(crossovers)
     end
 
+    @testset "wall-clock ceiling stops a run the iteration budget cannot" begin
+        # The iteration budget bounds matvecs, not time. Orthogonalization is
+        # O(m^2 N) and overtakes the matvec inside the budget's own range --
+        # measured at 10,230 dofs, 385 iterations cost 32.8 s against 11.1 s of
+        # matvec -- so only a clock can bound the damage.
+        n = 300
+        eigenvalues = ComplexF32[ComplexF32(1.05) + cis(Float32(2pi * i / n)) for i in 1:n]
+        matrix = Matrix{ComplexF32}(Diagonal(eigenvalues))
+        for row in 1:n, column in (row + 1):n
+            matrix[row, column] += ComplexF32(cos(0.7f0 * row), sin(0.3f0 * column)) *
+                                   0.5f0 / sqrt(Float32(n))
+        end
+        rhs = ComplexF32[ComplexF32(sin(0.2f0 * row), cos(0.11f0 * row)) for row in 1:n]
+
+        # An unreachable tolerance runs until something else stops it. That
+        # count is a property of the operator, not a number to hard-code -- it
+        # is read here so the assertions below compare against it.
+        solve(; kwargs...) = beat_gmres!(zeros(ComplexF32, n), matrix, copy(rhs);
+                                         max_iterations=250, tolerance=1e-30,
+                                         restart=0, kwargs...)
+        natural = solve()
+        # An already-expired real monotonic deadline must stop before work.
+        # Comparing durations from separate solves is not reliable under load.
+        bounded = solve(deadline_ns=time_ns() - UInt64(1))
+        @test natural.iterations > 20
+        @test bounded.iterations < natural.iterations
+        @test bounded.converged == false
+        @test bounded.reason === :deadline
+
+        # Zero and negative mean no limit, so the default path is untouched.
+        for none in (0, -1.0)
+            @test solve(deadline_seconds=none).iterations == natural.iterations
+        end
+
+        # The cycle's solution update must happen before the timeout breaks out,
+        # not after: leaving early without it hands back the zero iterate and
+        # throws away every iteration that was paid for. Drive that boundary
+        # with a deterministic monotonic clock; a real short deadline may
+        # correctly expire before the first iteration under preemption.
+        ticks = Ref(0)
+        test_clock() = (ticks[] += 1; ticks[] == 1 ? UInt64(0) : UInt64(1))
+        x = zeros(ComplexF32, n)
+        partial = beat_gmres!(x, matrix, copy(rhs); max_iterations=250,
+                              tolerance=1e-30, restart=0, deadline_ns=1,
+                              clock_ns=test_clock)
+        @test partial.iterations == 1
+        @test partial.reason === :deadline
+        @test any(!iszero, x)
+    end
+
     @testset "iteration budget bounds a misrouted GMRES" begin
         # The budget is one LU's worth of matvecs, so a GMRES that exhausts it
-        # and falls back costs at most twice the direct solve. Without it the
-        # cap is min(n, 1000) and the loss is unbounded: measured 3.85x at
+        # has provably lost to the direct solve on that component. It does not
+        # bound orthogonalization wall time; the deadline above does. Without
+        # either guard the cap is min(n, 1000): measured 3.85x at
         # 4,751 dofs and 6 kHz, where the true iteration count is 429 against
         # the model's assumed 70.
         for (dofs, drives) in ((5_107, 1), (10_230, 1), (20_422, 4))
@@ -487,7 +538,9 @@ end
         gmres_solution, gmres_report = beat_solve_dense_system(matrix, rhs; method=:gmres)
         @test gmres_report.method === :gmres
         @test !gmres_report.fell_back
+        @test gmres_report.fallback_reason === nothing
         @test length(gmres_report.iterations) == 2
+        @test all(reason -> reason === :converged, gmres_report.termination_reasons)
         # The default tolerance, not a tighter number that happens to hold: this
         # asserts the contract the router promises, and asserting 1e-6 here would
         # silently re-pin the default that `_beat_gmres_tolerance` documents.
@@ -533,8 +586,44 @@ end
             solution, report = beat_solve_dense_system(matrix, reshape(rhs, :, 1); method=:gmres)
             @test report.fell_back
             @test report.method === :lu
-            @test occursin("after GMRES failed to converge", describe_dense_solve(report))
+            @test report.fallback_reason === :iteration_limit
+            @test report.termination_reasons == [:iteration_limit]
+            @test occursin("per-drive iteration limit", describe_dense_solve(report))
             @test norm(vec(solution) - reference) / norm(reference) < 1.0f-4
+        end
+
+        # Auto routing applies both budgets and says which one stopped it. A
+        # forced GMRES remains forced even when the model deadline is tiny.
+        withenv("BLAB_BEAT_GMRES_MODEL_ITERATIONS" => "1e-9",
+                "BLAB_BEAT_GMRES_BUDGET" => "1e-12",
+                "BLAB_BEAT_GMRES_TIME_CEILING" => "1e12") do
+            solution, report = beat_solve_dense_system(matrix, reshape(rhs, :, 1))
+            @test report.plan.reason === :model
+            @test report.fell_back
+            @test report.fallback_reason === :iteration_budget
+            @test report.termination_reasons == [:iteration_limit]
+            @test occursin("shared iteration budget", describe_dense_solve(report))
+            @test norm(vec(solution) - reference) / norm(reference) < 1.0f-4
+        end
+
+        withenv("BLAB_BEAT_GMRES_MODEL_ITERATIONS" => "1e-9",
+                "BLAB_BEAT_GMRES_BUDGET" => "1e12",
+                "BLAB_BEAT_GMRES_TIME_CEILING" => "1e-12") do
+            solution, report = beat_solve_dense_system(matrix, hcat(rhs, rhs))
+            @test report.plan.reason === :model
+            @test report.plan.drives == 2
+            @test report.fell_back
+            @test report.fallback_reason === :deadline
+            @test occursin("shared wall-clock deadline", describe_dense_solve(report))
+            @test norm(solution[:, 1] - reference) / norm(reference) < 1.0f-4
+
+            benign = Matrix{ComplexF32}(2.0f0 * I, n, n)
+            forced_solution, forced_report = beat_solve_dense_system(
+                benign, reshape(rhs, :, 1); method=:gmres,
+            )
+            @test !forced_report.fell_back
+            @test forced_report.method === :gmres
+            @test norm(benign * forced_solution[:, 1] - rhs) / norm(rhs) < 1.0f-5
         end
     end
 
@@ -544,6 +633,7 @@ end
         x = ones(ComplexF32, n)
         result = beat_gmres!(x, matrix, zeros(ComplexF32, n))
         @test result.converged
+        @test result.reason === :converged
         @test all(iszero, x)
     end
 
