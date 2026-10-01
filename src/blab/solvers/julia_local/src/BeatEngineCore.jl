@@ -351,6 +351,19 @@ function BoundaryMesh(vertices::Vector{SVector{3,T}}, faces::Vector{NTuple{3,Int
     return BoundaryMesh{T}(vertices, faces, physical_tags, centroids, normals, areas, face_vertices)
 end
 
+"""Normalise a near-correction cache argument into a tuple of caches.
+
+`nothing` becomes no caches, one cache becomes a one-tuple, and any tuple or
+vector passes through. Each cache carries a single `trial_transform`, so a
+symmetry mode with more than one image transform needs one cache per transform
+-- `:xy` mirrors across x, y and both, and correcting only the first leaves the
+other two integrating a near-singular kernel with the regular rule.
+"""
+_near_correction_cache_tuple(::Nothing) = ()
+_near_correction_cache_tuple(caches::Tuple) = caches
+_near_correction_cache_tuple(caches::AbstractVector) = Tuple(caches)
+_near_correction_cache_tuple(cache) = (cache,)
+
 struct NearCorrectionCache{T<:AbstractFloat}
     pairs_by_test::Vector{Vector{SingularCorrectionPair{T}}}
     pairs::Vector{SingularCorrectionPair{T}}
@@ -1206,6 +1219,8 @@ function assemble_regular_galerkin_operators(
     device_image_singular_cache=nothing,
     near_correction_cache=nothing,
     device_near_correction_cache=nothing,
+    # One cache, or one per symmetry image transform; see
+    # _near_correction_cache_tuple.
     image_near_correction_cache=nothing,
     device_image_near_correction_cache=nothing,
     rocm_assembly_mode=nothing,
