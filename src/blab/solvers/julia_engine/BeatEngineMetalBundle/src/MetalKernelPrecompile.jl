@@ -28,6 +28,13 @@ function precompile_metal_kernel_signatures()
         @info "BEAT Metal kernel workload skipped: requires Apple Silicon"
         return
     end
+    # Before Julia 1.11 device inference over shared Base methods can be
+    # serialised into the image and break host code later; Metal.jl gates its
+    # own real-kernel workload the same way.
+    if VERSION < v"1.11"
+        @info "BEAT Metal kernel workload skipped: requires Julia 1.11 or newer" VERSION
+        return
+    end
     successes = 0
     failures = 0
     try
