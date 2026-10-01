@@ -47,6 +47,7 @@ function build_metal_field_evaluation_cache(
 end
 
 function release_metal_field_evaluation_cache!(cache::MetalFieldEvaluationCache)
+    _release_metal_fast_field_tables!(cache)
     Metal.unsafe_free!(cache.source_points)
     Metal.unsafe_free!(cache.source_normals)
     Metal.unsafe_free!(cache.source_weights)
@@ -270,6 +271,9 @@ function evaluate_galerkin_field_metal(
     point_count = length(eval_points)
     point_count == 0 && return return_device ? MtlArray(Complex{T}[]) : Complex{T}[]
     _require_metal!()
+    if T === Float32
+        return _evaluate_galerkin_field_metal_fast(eval_points, pressure, q_neumann, k, cache; return_device=return_device)
+    end
     d_eval_points = MtlArray(_metal_eval_point_arrays(eval_points, T))
     pressure_on_device = pressure isa MtlArray
     neumann_on_device = q_neumann isa MtlArray

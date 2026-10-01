@@ -76,6 +76,7 @@ function release_metal_singular_correction_cache!(cache::MetalSingularCorrection
     Metal.unsafe_free!(cache.rule_offsets)
     Metal.unsafe_free!(cache.rule_test_points)
     Metal.unsafe_free!(cache.rule_trial_points)
+    _release_metal_fused_singular_tables!(cache)
     Metal.unsafe_free!(cache.rule_weights)
     return nothing
 end

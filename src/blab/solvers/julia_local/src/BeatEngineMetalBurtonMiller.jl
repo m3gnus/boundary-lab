@@ -43,7 +43,6 @@ struct MetalFusedGatherTables
     chunk_nodes           # MtlArray{Int32}: chunk-node position -> global P1 dof
     inc_offsets           # MtlArray{Int32}
     inc_packed            # MtlArray{Int32}: (trial local - 1) * 4 + local column
-    blocks                # MtlArray{Float32}: 24 * element_count * chunk_size
 end
 
 function _metal_fused_chunk_size(element_count::Int)
@@ -60,6 +59,10 @@ function _metal_fused_chunk_size(element_count::Int)
 end
 
 function _metal_fused_gather_tables(cache::MetalRegularAssemblyCache)
+    lock(() -> _build_metal_fused_gather_tables(cache), _metal_packed_cache_lock)
+end
+
+function _build_metal_fused_gather_tables(cache::MetalRegularAssemblyCache)
     tables = cache.fused_gather_tables[]
     tables === nothing || return tables
     indices = cache.element_indices
@@ -95,7 +98,6 @@ function _metal_fused_gather_tables(cache::MetalRegularAssemblyCache)
         end
         chunk_node_offsets[chunk + 1] = length(chunk_nodes) + 1
     end
-    blocks = MtlArray{Float32}(undef, _METAL_FUSED_COMPONENTS * element_count * chunk_size)
     tables = MetalFusedGatherTables(
         chunk_size,
         chunk_count,
@@ -105,7 +107,6 @@ function _metal_fused_gather_tables(cache::MetalRegularAssemblyCache)
         MtlArray(chunk_nodes),
         MtlArray(inc_offsets),
         MtlArray(inc_packed),
-        blocks,
     )
     cache.fused_gather_tables[] = tables
     return tables
@@ -119,12 +120,12 @@ function _release_metal_fused_gather_tables!(cache::MetalRegularAssemblyCache)
     Metal.unsafe_free!(tables.chunk_nodes)
     Metal.unsafe_free!(tables.inc_offsets)
     Metal.unsafe_free!(tables.inc_packed)
-    Metal.unsafe_free!(tables.blocks)
     cache.fused_gather_tables[] = nothing
     return nothing
 end
 
-# Both fused pair kernels form the same algebra as `burton_miller_neumann_matrices`,
+# The fused pair kernel (`_metal_fused_pair_blocks_kernel!` in BeatEngineMetalFusedKernels.jl)
+# forms the same algebra as `burton_miller_neumann_matrices`,
 # per pair and inside the accumulation:
 #   lhs contribution of a pair: -D + (i/k) H, so
 #     re = -D_re - H_im / k      im = -D_im + H_re / k
@@ -149,193 +150,6 @@ end
 # The hypersingular curl term is not inside the test loop at all: H is
 # curl_products * G0 - k^2 (n.n') * (basis-weighted sums), and only the second
 # half accumulates per test point. The first half is added once after the loop.
-@inline function _metal_regular_pair_fused_blocks(
-    face_vertices,
-    normals,
-    areas,
-    curls,
-    rule_points,
-    rule_weights,
-    element_rule_points,
-    test_index::Int32,
-    trial_index::Int32,
-    face_count::Int32,
-    k,
-    inverse_k,
-    ::Val{R},
-    trial_sign_x,
-    trial_sign_y,
-    trial_sign_z,
-    trial_curl_sign_x,
-    trial_curl_sign_y,
-    trial_curl_sign_z,
-) where {R}
-    T = typeof(k)
-    inv_four_pi = T(0.07957747154594767)
-    @inbounds begin
-    lhs_re = zero(SVector{9,T})
-    lhs_im = zero(SVector{9,T})
-    rhs_re = zero(SVector{3,T})
-    rhs_im = zero(SVector{3,T})
-    test_nx = normals[test_index]
-    test_ny = normals[test_index + face_count]
-    test_nz = normals[test_index + Int32(2) * face_count]
-    trial_nx = trial_sign_x * normals[trial_index]
-    trial_ny = trial_sign_y * normals[trial_index + face_count]
-    trial_nz = trial_sign_z * normals[trial_index + Int32(2) * face_count]
-    normal_product = test_nx * trial_nx + test_ny * trial_ny + test_nz * trial_nz
-    jac_scale = T(4) * areas[test_index] * areas[trial_index]
-    trial_signs = SVector(trial_sign_x, trial_sign_y, trial_sign_z)
-    # -(i/k) * k^2 (n.n'), folded into the per-test-point combination.
-    curl_scale = inverse_k * k * k * normal_product
-
-    g_total_re = zero(k)
-    g_total_im = zero(k)
-    test_q = Int32(1)
-    while test_q <= Int32(R)
-        test_xi = rule_points[test_q]
-        test_eta = rule_points[test_q + Int32(R)]
-        tb1 = one(k) - test_xi - test_eta
-        tb2 = test_xi
-        tb3 = test_eta
-        test_basis = SVector(tb1, tb2, tb3)
-        point_index = test_index + face_count * (test_q - Int32(1))
-        x = element_rule_points[point_index]
-        y = element_rule_points[point_index + face_count * Int32(R)]
-        z = element_rule_points[point_index + face_count * Int32(2 * R)]
-        test_weight = rule_weights[test_q]
-
-        s_re = zero(k)
-        s_im = zero(k)
-        a_re = zero(k)
-        a_im = zero(k)
-        d_re = zero(SVector{3,T})
-        d_im = zero(SVector{3,T})
-        h_re = zero(SVector{3,T})
-        h_im = zero(SVector{3,T})
-        context = (x, y, z, test_weight * jac_scale, k, inv_four_pi,
-            test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs,
-            element_rule_points, rule_points, rule_weights, trial_index, face_count)
-        s_re, s_im, a_re, a_im, d_re, d_im, h_re, h_im = _metal_trial_fold(
-            (s_re, s_im, a_re, a_im, d_re, d_im, h_re, h_im),
-            context, Val(R), Val(R),
-        )
-        # rhs coefficient: -S - (i/k) K'
-        rhs_re += test_basis * (-s_re + inverse_k * a_im)
-        rhs_im += test_basis * (-s_im - inverse_k * a_re)
-        g_total_re += s_re
-        g_total_im += s_im
-        # lhs: -D + (i/k) H, less the curl term added after the loop.
-        u_re = -d_re + curl_scale * h_im
-        u_im = -d_im - curl_scale * h_re
-        lhs_re += SVector(
-            tb1 * u_re[1], tb2 * u_re[1], tb3 * u_re[1],
-            tb1 * u_re[2], tb2 * u_re[2], tb3 * u_re[2],
-            tb1 * u_re[3], tb2 * u_re[3], tb3 * u_re[3],
-        )
-        lhs_im += SVector(
-            tb1 * u_im[1], tb2 * u_im[1], tb3 * u_im[1],
-            tb1 * u_im[2], tb2 * u_im[2], tb3 * u_im[2],
-            tb1 * u_im[3], tb2 * u_im[3], tb3 * u_im[3],
-        )
-        test_q += Int32(1)
-    end
-    # (i/k) * curl_products * G0, computed after the loop so its nine values are
-    # not live registers during it.
-    curl_products = _metal_pair_curl_products(
-        curls,
-        test_index,
-        trial_index,
-        face_count,
-        trial_curl_sign_x,
-        trial_curl_sign_y,
-        trial_curl_sign_z,
-    )
-    lhs_re -= curl_products * (inverse_k * g_total_im)
-    lhs_im += curl_products * (inverse_k * g_total_re)
-    return lhs_re, lhs_im, rhs_re, rhs_im
-    end
-end
-
-function _metal_fused_pair_blocks_kernel!(
-    blocks,
-    face_vertices,
-    normals,
-    areas,
-    faces,
-    curls,
-    rule_points,
-    rule_weights,
-    element_rule_points,
-    elements,
-    element_count::Int32,
-    chunk_start::Int32,
-    chunk_count::Int32,
-    pair_stride::Int32,
-    k,
-    inverse_k,
-    face_count::Int32,
-    ::Val{R},
-    pair_offsets,
-    singular_trial_indices,
-    skip_mode,
-    trial_sign_x,
-    trial_sign_y,
-    trial_sign_z,
-    trial_curl_sign_x,
-    trial_curl_sign_y,
-    trial_curl_sign_z,
-) where {R}
-    position = thread_position_in_grid_2d()
-    test_position = Int32(position.x)
-    trial_local = Int32(position.y)
-    (test_position > element_count || trial_local > chunk_count) && return nothing
-    @inbounds test_index = Int32(elements[test_position])
-    @inbounds trial_index = Int32(elements[chunk_start + trial_local - Int32(1)])
-    base = test_position + element_count * (trial_local - Int32(1))
-    if _metal_pair_is_skipped(
-        faces,
-        face_count,
-        test_index,
-        trial_index,
-        pair_offsets,
-        singular_trial_indices,
-        skip_mode,
-    )
-        component = Int32(0)
-        while component < Int32(_METAL_FUSED_COMPONENTS)
-            @inbounds blocks[base + component * pair_stride] = zero(eltype(blocks))
-            component += Int32(1)
-        end
-        return nothing
-    end
-    lhs_re, lhs_im, rhs_re, rhs_im = _metal_regular_pair_fused_blocks(
-        face_vertices,
-        normals,
-        areas,
-        curls,
-        rule_points,
-        rule_weights,
-        element_rule_points,
-        test_index,
-        trial_index,
-        face_count,
-        k,
-        inverse_k,
-        Val(R),
-        trial_sign_x,
-        trial_sign_y,
-        trial_sign_z,
-        trial_curl_sign_x,
-        trial_curl_sign_y,
-        trial_curl_sign_z,
-    )
-    _metal_store_block!(blocks, base, pair_stride, Int32(0), lhs_re)
-    _metal_store_block!(blocks, base, pair_stride, Int32(9), lhs_im)
-    _metal_store_block!(blocks, base, pair_stride, Int32(18), rhs_re)
-    _metal_store_block!(blocks, base, pair_stride, Int32(21), rhs_im)
-    return nothing
-end
 
 # One thread per (P1 row, P1 node touched by the chunk), exactly the ownership
 # of `_metal_gather_dlp_hyp_kernel!` but reading two components instead of four
@@ -467,22 +281,10 @@ function _metal_fused_rhs_reduce_kernel!(
     return nothing
 end
 
-function _launch_metal_fused_pair_kernels!(
-    lhs,
-    rhs_partial,
-    q_neumann,
-    cache::MetalRegularAssemblyCache,
-    k,
-    pair_offsets,
-    singular_trial_indices,
-    skip_mode,
-    trial_sign_x,
-    trial_sign_y,
-    trial_sign_z,
-    trial_curl_sign_x,
-    trial_curl_sign_y,
-    trial_curl_sign_z,
-)
+# `transforms`: one tuple (pair_offsets, singular_trial_indices, skip_mode, 6 signs) per symmetry
+# transform, the identity first. Per chunk, the first transform writes the pair blocks and later ones
+# add into them, so the gathers run once per chunk.
+function _launch_metal_fused_pair_kernels!(lhs, rhs_partial, q_neumann, cache::MetalRegularAssemblyCache, k, transforms, blocks, stage_timings)
     element_count = length(cache.element_indices)
     element_count == 0 && return nothing
     rule_count = cache.rule_count
@@ -496,46 +298,31 @@ function _launch_metal_fused_pair_kernels!(
     dp0_count = Int32(cache.dp0_dof_count)
     drive_count = Int32(size(q_neumann, 2))
     timed = get(ENV, "BLAB_METAL_GATHER_TIMING", "0") == "1"
+    packed = _metal_packed_pair_tables_for(cache)
     timed && Metal.synchronize()
     stamp = time()
     for chunk in 1:tables.chunk_count
         chunk_start = (chunk - 1) * chunk_size + 1
         chunk_count = min(chunk_size, element_count - chunk_start + 1)
-        Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _metal_fused_pair_blocks_kernel!(
-            tables.blocks,
-            cache.face_vertices,
-            cache.normals,
-            cache.areas,
-            cache.faces,
-            cache.curls,
-            cache.rule_points,
-            cache.rule_weights,
-            cache.element_rule_points,
-            tables.elements,
-            Int32(element_count),
-            Int32(chunk_start),
-            Int32(chunk_count),
-            pair_stride,
-            k,
-            inv(k),
-            Int32(cache.face_count),
-            Val(rule_count),
-            pair_offsets,
-            singular_trial_indices,
-            skip_mode,
-            trial_sign_x,
-            trial_sign_y,
-            trial_sign_z,
-            trial_curl_sign_x,
-            trial_curl_sign_y,
-            trial_curl_sign_z,
-        )
-        stamp = _metal_gather_stage!("fused_pairs", timed, stamp)
+        for (transform_number, transform) in enumerate(transforms)
+            (pair_offsets, singular_trial_indices, skip_mode, trial_sign_x, trial_sign_y, trial_sign_z,
+             trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z) = transform
+            Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _metal_fused_pair_blocks_kernel!(
+                blocks, packed.points4, packed.normals4, cache.areas, packed.curls4, cache.faces, tables.elements,
+                cache.rule_points, cache.rule_weights,
+                Int32(element_count), Int32(chunk_start), Int32(chunk_count), pair_stride,
+                k, inv(k), Int32(cache.face_count), Val(packed.rule), Val(rule_count),
+                pair_offsets, singular_trial_indices, skip_mode,
+                trial_sign_x, trial_sign_y, trial_sign_z, trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
+                Val(transform_number > 1),
+            )
+            stamp = _metal_fused_stage!(stage_timings, "fused_pairs", timed, stamp)
+        end
         _metal_launch(
             _metal_fused_rhs_gather_kernel!,
             cache.p1_dof_count * chunk_count,
             rhs_partial,
-            tables.blocks,
+            blocks,
             tables.elements,
             tables.element_positions,
             cache.vertex_offsets,
@@ -553,14 +340,14 @@ function _launch_metal_fused_pair_kernels!(
             drive_count;
             groupsize=groupsize,
         )
-        stamp = _metal_gather_stage!("fused_rhs", timed, stamp)
+        stamp = _metal_fused_stage!(stage_timings, "fused_rhs", timed, stamp)
         node_start = tables.chunk_node_offsets[chunk]
         node_count = tables.chunk_node_offsets[chunk + 1] - node_start
         _metal_launch(
             _metal_fused_lhs_gather_kernel!,
             cache.p1_dof_count * node_count,
             lhs,
-            tables.blocks,
+            blocks,
             tables.element_positions,
             cache.vertex_offsets,
             cache.incident_elements,
@@ -575,7 +362,7 @@ function _launch_metal_fused_pair_kernels!(
             p1_count;
             groupsize=groupsize,
         )
-        stamp = _metal_gather_stage!("fused_lhs", timed, stamp)
+        stamp = _metal_fused_stage!(stage_timings, "fused_lhs", timed, stamp)
     end
     return nothing
 end
@@ -587,8 +374,8 @@ end
 # same mesh and frequency rather than trusting the validation tolerances.
 #
 # The combination is formed inside the Duffy quadrature loop rather than after
-# it -- what `_metal_regular_pair_fused_blocks` already does for the regular
-# kernel, and for the same two reasons.
+# it -- what the fused regular kernel already does, and for the same two
+# reasons. The kernels are in BeatEngineMetalFusedKernels.jl.
 #
 # `_metal_singular_pair_blocks`, which the four-operator path still uses,
 # carries 50 live accumulator floats through the loop (slp 3+3, adj 3+3,
@@ -610,173 +397,6 @@ end
 # The per-pair algebra is `burton_miller_neumann_matrices` formed per pair:
 #   lhs contribution: -D + (i/k) H, so re = -D_re - H_im / k, im = -D_im + H_re / k
 #   rhs coefficient:  -S - (i/k) K', so re = -S_re + K'_im / k, im = -S_im - K'_re / k
-@inline function _metal_singular_pair_fused_bm_blocks(
-    linear_index::Int32,
-    test_indices,
-    trial_indices,
-    rule_indices,
-    jac_scales,
-    normal_products,
-    rule_offsets,
-    rule_test_points,
-    rule_trial_points,
-    rule_weights,
-    face_vertices,
-    normals,
-    curls,
-    k,
-    inverse_k,
-    face_count::Int32,
-    pair_count::Int32,
-    rule_point_count::Int32,
-    part_count::Int32,
-    trial_sign_x,
-    trial_sign_y,
-    trial_sign_z,
-    trial_curl_sign_x,
-    trial_curl_sign_y,
-    trial_curl_sign_z,
-)
-    pair_position = (linear_index - Int32(1)) % pair_count + Int32(1)
-    part = (linear_index - Int32(1)) ÷ pair_count + Int32(1)
-    T = typeof(k)
-    @inbounds begin
-        test_index = Int32(test_indices[pair_position])
-        trial_index = Int32(trial_indices[pair_position])
-        rule_index = Int32(rule_indices[pair_position])
-        q_first = Int32(rule_offsets[rule_index])
-        q_last = Int32(rule_offsets[rule_index + Int32(1)]) - Int32(1)
-        per_part = cld(q_last - q_first + Int32(1), part_count)
-        q = q_first + (part - Int32(1)) * per_part
-        q_stop = min(q + per_part - Int32(1), q_last)
-        jac_scale = jac_scales[pair_position]
-        normal_product = normal_products[pair_position]
-        test_nx = normals[test_index]
-        test_ny = normals[test_index + face_count]
-        test_nz = normals[test_index + Int32(2) * face_count]
-        trial_nx = trial_sign_x * normals[trial_index]
-        trial_ny = trial_sign_y * normals[trial_index + face_count]
-        trial_nz = trial_sign_z * normals[trial_index + Int32(2) * face_count]
-    end
-    inv_four_pi = T(0.07957747154594767)
-    # -(i/k) * k^2 (n.n'), folded into the per-point combination.
-    curl_scale = inverse_k * k * k * normal_product
-    lhs_re = zero(SVector{9,T}); lhs_im = zero(SVector{9,T})
-    rhs_re = zero(SVector{3,T}); rhs_im = zero(SVector{3,T})
-    g_total_re = zero(T); g_total_im = zero(T)
-    while q <= q_stop
-        @inbounds begin
-            test_xi = rule_test_points[q]
-            test_eta = rule_test_points[q + rule_point_count]
-            trial_xi = rule_trial_points[q]
-            trial_eta = rule_trial_points[q + rule_point_count]
-            weight = rule_weights[q] * jac_scale
-        end
-        tb1 = one(k) - test_xi - test_eta
-        rb1 = one(k) - trial_xi - trial_eta
-        x, y, z = _metal_face_point(face_vertices, test_index, face_count, tb1, test_xi, test_eta)
-        sx, sy, sz = _metal_face_point(face_vertices, trial_index, face_count, rb1, trial_xi, trial_eta)
-        Base.@fastmath begin
-            dx = sx * trial_sign_x - x
-            dy = sy * trial_sign_y - y
-            dz = sz * trial_sign_z - z
-            radius2 = dx * dx + dy * dy + dz * dz
-            if radius2 > zero(k)
-                inv_radius = _metal_fast_rsqrt(radius2)
-                radius = radius2 * inv_radius
-                phase = k * radius
-                green_scale = inv_radius * inv_four_pi * weight
-                green_re = _metal_fast_cos(phase) * green_scale
-                green_im = _metal_fast_sin(phase) * green_scale
-                grad_re = -green_re * inv_radius - green_im * k
-                grad_im = green_re * k - green_im * inv_radius
-                test_dot = -(dx * test_nx + dy * test_ny + dz * test_nz) * inv_radius
-                trial_dot = (dx * trial_nx + dy * trial_ny + dz * trial_nz) * inv_radius
-                tb = SVector(tb1, test_xi, test_eta)
-                outer = SVector(
-                    tb1 * rb1, test_xi * rb1, test_eta * rb1,
-                    tb1 * trial_xi, test_xi * trial_xi, test_eta * trial_xi,
-                    tb1 * trial_eta, test_xi * trial_eta, test_eta * trial_eta,
-                )
-                # rhs coefficient: -S - (i/k) K'
-                rhs_re += tb * (-green_re + inverse_k * (grad_im * test_dot))
-                rhs_im += tb * (-green_im - inverse_k * (grad_re * test_dot))
-                # lhs: -D + (i/k) H, less the loop-invariant curl term.
-                u_re = -(grad_re * trial_dot) + curl_scale * green_im
-                u_im = -(grad_im * trial_dot) - curl_scale * green_re
-                lhs_re += outer * u_re
-                lhs_im += outer * u_im
-                g_total_re += green_re
-                g_total_im += green_im
-            end
-        end
-        q += Int32(1)
-    end
-    # (i/k) * curl_products * G0, added after the loop so its nine values are
-    # not live registers during it.
-    curl_products = _metal_pair_curl_products(
-        curls, test_index, trial_index, face_count,
-        trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
-    )
-    lhs_re -= curl_products * (inverse_k * g_total_im)
-    lhs_im += curl_products * (inverse_k * g_total_re)
-    return lhs_re, lhs_im, rhs_re, rhs_im
-end
-
-function _metal_singular_fused_bm_blocks_kernel!(
-    lhs_values,
-    rhs_values,
-    test_indices,
-    trial_indices,
-    rule_indices,
-    jac_scales,
-    normal_products,
-    rule_offsets,
-    rule_test_points,
-    rule_trial_points,
-    rule_weights,
-    face_vertices,
-    normals,
-    curls,
-    k,
-    inverse_k,
-    face_count::Int32,
-    pair_count::Int32,
-    rule_point_count::Int32,
-    part_count::Int32,
-    trial_sign_x,
-    trial_sign_y,
-    trial_sign_z,
-    trial_curl_sign_x,
-    trial_curl_sign_y,
-    trial_curl_sign_z,
-)
-    linear_index = Int32(thread_position_in_grid_1d())
-    linear_index > pair_count * part_count && return nothing
-    lhs_re, lhs_im, rhs_re, rhs_im = _metal_singular_pair_fused_bm_blocks(
-        linear_index,
-        test_indices, trial_indices, rule_indices, jac_scales, normal_products,
-        rule_offsets, rule_test_points, rule_trial_points, rule_weights,
-        face_vertices, normals, curls, k, inverse_k,
-        face_count, pair_count, rule_point_count, part_count,
-        trial_sign_x, trial_sign_y, trial_sign_z,
-        trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
-    )
-    value_stride = pair_count * part_count
-    @inbounds begin
-        i = 1
-        while i <= 3
-            rhs_values[linear_index + Int32(i - 1) * value_stride] = Complex(rhs_re[i], rhs_im[i])
-            i += 1
-        end
-        i = 1
-        while i <= 9
-            lhs_values[linear_index + Int32(i - 1) * value_stride] = Complex(lhs_re[i], lhs_im[i])
-            i += 1
-        end
-    end
-    return nothing
-end
 
 function _metal_singular_fused_bm_scatter_kernel!(
     lhs_f32,
@@ -856,7 +476,8 @@ function _launch_metal_fused_singular_kernels!(
     regular_cache::MetalRegularAssemblyCache,
     singular_cache::MetalSingularCorrectionCache,
     k,
-    transform::SymmetryTransform=SymmetryTransform(:identity, SVector{3,Int}(1, 1, 1), 1),
+    transform::SymmetryTransform=SymmetryTransform(:identity, SVector{3,Int}(1, 1, 1), 1);
+    stage_timings=Dict{String,Float64}(),
 )
     pair_count = singular_cache.pair_count
     pair_count == 0 && return nothing
@@ -870,20 +491,33 @@ function _launch_metal_fused_singular_kernels!(
     rule_point_count = length(singular_cache.rule_weights)
     part_count = _metal_singular_part_count()
     value_count = pair_count * part_count
+    timed = get(ENV, "BLAB_METAL_GATHER_TIMING", "0") == "1"
+    timed && Metal.synchronize()
+    stamp = time()
+    if timed && transform.label == :identity
+        stage_timings["sing_info_pairs"] = pair_count
+        stage_timings["sing_info_parts"] = part_count
+        stage_timings["sing_info_rule_points"] = rule_point_count
+    end
     lhs_values = Metal.zeros(eltype(lhs), value_count, 9)
     rhs_values = Metal.zeros(eltype(lhs), value_count, 3)
-    _metal_launch(
-        _metal_singular_fused_bm_blocks_kernel!,
-        value_count,
-        lhs_values, rhs_values,
-        singular_cache.test_indices, singular_cache.trial_indices, singular_cache.rule_indices,
-        singular_cache.jac_scales, singular_cache.normal_products, singular_cache.rule_offsets,
-        singular_cache.rule_test_points, singular_cache.rule_trial_points, singular_cache.rule_weights,
-        regular_cache.face_vertices, regular_cache.normals, regular_cache.curls,
-        k, inv(k), Int32(regular_cache.face_count), Int32(pair_count),
-        Int32(rule_point_count), Int32(part_count),
-        sx, sy, sz, csx, csy, csz,
-    )
+    stamp = _metal_fused_stage!(stage_timings, "sing_alloc", timed, stamp)
+    tables = _metal_fused_singular_tables_for(regular_cache, singular_cache)
+    packed = _metal_packed_pair_tables_for(regular_cache)
+    for (point_count, positions) in tables.groups
+        group_count = length(positions)
+        _metal_launch(
+            _metal_fused_singular_packed_kernel!, group_count * part_count,
+            lhs_values, rhs_values, positions,
+            singular_cache.test_indices, singular_cache.trial_indices, singular_cache.rule_indices,
+            singular_cache.jac_scales, singular_cache.normal_products, singular_cache.rule_offsets,
+            tables.rule_points4, singular_cache.rule_weights, tables.vertices4, packed.normals4, packed.curls4,
+            k, inv(k), Int32(group_count), Int32(pair_count),
+            sx, sy, sz, csx, csy, csz,
+            Val(point_count), Val(part_count),
+        )
+    end
+    stamp = _metal_fused_stage!(stage_timings, "sing_blocks", timed, stamp)
     _metal_launch(
         _metal_singular_fused_bm_scatter_kernel!,
         pair_count,
@@ -904,6 +538,7 @@ function _launch_metal_fused_singular_kernels!(
         regular_cache.face_count,
     )
     Metal.synchronize()
+    stamp = _metal_fused_stage!(stage_timings, "sing_gather", timed, stamp)
     Metal.unsafe_free!(lhs_values)
     Metal.unsafe_free!(rhs_values)
     return nothing
@@ -988,9 +623,9 @@ function assemble_burton_miller_neumann_system_metal(
     d_q = q_host isa MtlArray ? q_host : MtlArray(Complex{T}.(q_host))
     owns_q = !(q_host isa MtlArray)
     tables = _metal_fused_gather_tables(device_cache)
-    lhs = rhs = rhs_partial = nothing
+    lhs = rhs = rhs_partial = blocks = nothing
     succeeded = false
-    empty!(_metal_gather_stage_timing)
+    stage_timings = Dict{String,Float64}()
     try
         storage = metal_operator_storage_mode()
         allocation_elapsed = @elapsed begin
@@ -1000,6 +635,8 @@ function assemble_burton_miller_neumann_system_metal(
             # right-hand-side partials are device-only scratch and stay private.
             lhs = Metal.zeros(Complex{T}, p1_count, p1_count; storage=storage)
             rhs = Metal.zeros(Complex{T}, p1_count, drive_count; storage=storage)
+            # Pair scratch belongs to this assembly, never to the shared geometry cache.
+            blocks = MtlArray{Float32}(undef, _METAL_FUSED_COMPONENTS * length(device_cache.element_indices) * tables.chunk_size)
             rhs_partial = Metal.zeros(Complex{T}, p1_count, tables.chunk_size, drive_count)
             Metal.synchronize()
         end
@@ -1011,27 +648,22 @@ function assemble_burton_miller_neumann_system_metal(
         skip_image_singular = !skip_singular
         one_t = one(T)
         kernel_elapsed = @elapsed begin
-            _launch_metal_fused_pair_kernels!(
-                lhs, rhs_partial, d_q, device_cache, k,
-                device_cache.vertex_offsets, device_cache.incident_elements, Int32(0),
-                one_t, one_t, one_t, one_t, one_t, one_t,
-            )
+            transforms = Any[(device_cache.vertex_offsets, device_cache.incident_elements, Int32(0),
+                              one_t, one_t, one_t, one_t, one_t, one_t)]
             for (transform, image_cache) in zip(device_cache.image_transforms, device_cache.image_singular_caches)
-                _launch_metal_fused_pair_kernels!(
-                    lhs, rhs_partial, d_q, device_cache, k,
-                    image_cache.pair_offsets, image_cache.trial_indices,
+                push!(transforms, (image_cache.pair_offsets, image_cache.trial_indices,
                     skip_image_singular ? Int32(1) : Int32(2),
                     T(transform.signs[1]), T(transform.signs[2]), T(transform.signs[3]),
                     T(transform.determinant * transform.signs[1]),
                     T(transform.determinant * transform.signs[2]),
-                    T(transform.determinant * transform.signs[3]),
-                )
+                    T(transform.determinant * transform.signs[3])))
             end
+            _launch_metal_fused_pair_kernels!(lhs, rhs_partial, d_q, device_cache, k, transforms, blocks, stage_timings)
             Metal.synchronize()
         end
         timing !== nothing && (timing["metal_fused_regular_kernel"] = kernel_elapsed)
         if timing !== nothing
-            for (stage, elapsed) in _metal_gather_stage_timing
+            for (stage, elapsed) in stage_timings
                 timing["metal_fused_" * stage] = elapsed
             end
         end
@@ -1057,7 +689,7 @@ function assemble_burton_miller_neumann_system_metal(
             active_singular_cache = device_singular_cache === nothing ?
                 build_metal_singular_correction_cache(correction_cache) : device_singular_cache
             singular_elapsed = @elapsed begin
-                _launch_metal_fused_singular_kernels!(lhs, rhs, d_q, device_cache, active_singular_cache, k)
+                _launch_metal_fused_singular_kernels!(lhs, rhs, d_q, device_cache, active_singular_cache, k; stage_timings=stage_timings)
             end
             timing !== nothing && (timing["metal_fused_singular_kernel"] = singular_elapsed)
             singular_pairs = correction_cache.pair_count
@@ -1065,11 +697,16 @@ function assemble_burton_miller_neumann_system_metal(
             image_elapsed = @elapsed begin
                 for (transform, image_cache) in zip(device_cache.image_transforms, device_cache.image_singular_caches)
                     image_cache.pair_count == 0 && continue
-                    _launch_metal_fused_singular_kernels!(lhs, rhs, d_q, device_cache, image_cache, k, transform)
+                    _launch_metal_fused_singular_kernels!(lhs, rhs, d_q, device_cache, image_cache, k, transform; stage_timings=stage_timings)
                 end
                 Metal.synchronize()
             end
             timing !== nothing && (timing["metal_fused_image_singular_kernel"] = image_elapsed)
+            if timing !== nothing
+                for (stage, elapsed) in stage_timings
+                    startswith(stage, "sing_") && (timing["metal_fused_" * stage] = elapsed)
+                end
+            end
             image_singular_pairs = device_cache.image_singular_pair_count
         end
 
@@ -1119,6 +756,7 @@ function assemble_burton_miller_neumann_system_metal(
             assembly_mode=:metal_fused_burton_miller,
         )
     finally
+        blocks === nothing || Metal.unsafe_free!(blocks)
         rhs_partial === nothing || Metal.unsafe_free!(rhs_partial)
         owns_q && Metal.unsafe_free!(d_q)
         owns_identity_cache && release_metal_fused_identity_cache!(identity_cache)
@@ -1192,4 +830,13 @@ end
 function solve_metal_burton_miller_system(system; method::Symbol=beat_dense_solve_method())
     pressure, _ = solve_metal_burton_miller_system_with_report(system; method=method)
     return pressure
+end
+
+# Assembly-local diagnostics, also safe when independent callers assemble concurrently.
+@inline function _metal_fused_stage!(timings, name::String, timed::Bool, start::Float64)
+    timed || return start
+    Metal.synchronize()
+    now = time()
+    timings[name] = get(timings, name, 0.0) + (now - start)
+    return now
 end

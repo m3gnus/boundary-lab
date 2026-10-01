@@ -300,3 +300,40 @@ changes and predates the singular fusion.
 either a better-conditioned `xy` fixture or a deterministic singular scatter —
 not a wider tolerance. `off`, `x` and `ground` all pass, and the `xy` arm is
 still one `BLAB_VALIDATE_SYMMETRY=xy` away for anyone working on it.
+
+## Cached source-entry kernels and packed exterior evaluation
+
+`BeatEngineMetalBundle` caches the source-entry worker and production Metal
+kernel signatures in package images with Metal 1.11.1 / GPUCompiler 2.9.0.
+The workload compiles and links with `Metal.mtlfunction` without launching
+engine kernels, gates on Apple Silicon, reports failures and counts, and clears
+process-local Metal state. The worker entry loads Metal before JSON to retain
+its cached call graph. Custom specializations can still compile at runtime.
+
+Every backend bundle's host workload uses the worker's JSON-decoded request
+type, plus a representative quadrant-plate request with symmetry images,
+image-singular pairs, singular order 4, two frequencies and sphere/diagonal
+outputs. The source-entry signature coverage gate observes production requests
+even on package-image cache hits and fails if a signature is missing.
+
+```sh
+julia --project=src/blab/solvers/julia_metal src/blab/solvers/julia_local/tests/metal_kernel_coverage_tests.jl --generate
+julia --project=src/blab/solvers/julia_metal -e 'using Pkg; Pkg.precompile()'
+julia --project=src/blab/solvers/julia_metal src/blab/solvers/julia_local/tests/metal_kernel_coverage_tests.jl
+```
+
+The packed Float32 field kernel, multi-drive API and fused exterior pair kernels
+come from closed PR #15 (BumelantPZA; source commits `7e4a39e`, `7c8491a`,
+required helpers `09388b9`). Geometry is packed into float4 loads and read-only
+tables are published under locks. Regular symmetry images accumulate before
+one gather per chunk. Grouped singular kernels use the full Duffy rule at every
+frequency and retain this engine's existing atomic scatter. Pair blocks and
+timing dictionaries are private to each assembly. The multi-drive field API
+validates lengths before fallback and batches up to eight drives. No singular
+split, global BLAS swap, pooling or router change is included.
+
+`validate_metal_packed_exterior.jl` races packed singular-table publication and
+regular assembly scratch, requires exact regular-assembly repetition, checks
+field parity and same-specialization repetition, and exercises the multi-drive
+batch boundary and malformed inputs. The existing singular, exterior and
+symmetry validators cover the numerical path with their existing tolerances.

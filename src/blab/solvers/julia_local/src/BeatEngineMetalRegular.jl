@@ -254,5 +254,6 @@ function release_metal_regular_assembly_cache!(cache::MetalRegularAssemblyCache)
     end
     _release_metal_gather_tables!(cache)
     _release_metal_fused_gather_tables!(cache)
+    _release_metal_packed_pair_tables!(cache)
     return nothing
 end

@@ -27,6 +27,7 @@ backend rather than inherit whatever the building process happened to have set.
 module BeatEngineMetalBundle
 
 using PrecompileTools: @compile_workload
+import Metal
 
 const BEAT_ENGINE_BACKEND = "metal"
 
@@ -82,18 +83,37 @@ const WORKLOAD_MESH = """
 \$EndElements
 """
 
+include("MetalKernelPrecompile.jl")
+
+# Shared by the compiled CPU and Metal bundles. The plate touches both symmetry
+# planes, has non-adjacent triangles, and has singular pairs with its images.
+function workload_plate_mesh()
+    io = IOBuffer()
+    print(io, first(split(WORKLOAD_MESH, "\$Nodes")), "\$Nodes\n9\n")
+    for y in 0:2, x in 0:2
+        println(io, 1 + x + 3y, " ", 0.04x, " ", 0.04y, " 0.0")
+    end
+    print(io, "\$EndNodes\n\$Elements\n8\n")
+    face = 0
+    for y in 0:1, x in 0:1
+        a = 1 + x + 3y
+        for vertices in ((a, a + 1, a + 4), (a, a + 4, a + 3))
+            face += 1
+            println(io, face, " 2 2 2 2 ", join(vertices, " "))
+        end
+    end
+    print(io, "\$EndElements\n")
+    return String(take!(io))
+end
+
+
 @compile_workload begin
     # Solve one frequency on the CPU backend. Running a whole request is the
     # only way to reach the driver's real call graph, and that graph -- not
     # loading the engine -- was the largest term in a cold start.
     #
-    # The CPU backend even in a GPU bundle, deliberately. It compiles
-    # everything up to and including the backend branch, it is the same code a
-    # GPU solve runs to get there, and it needs no device: precompilation runs
-    # in a sandboxed worker on a build machine that may have no accelerator at
-    # all. What a GPU workload would add is its own kernel compilation, and
-    # that cannot be cached to disk in any case -- it is why the worker is kept
-    # alive between solves.
+    # Build the host call graph without launching accelerator kernels.
+    # Requests use the same JSON-decoded type as the worker boundary.
     directory = mktempdir()
     try
         mesh = joinpath(directory, "workload.msh")
@@ -122,8 +142,24 @@ const WORKLOAD_MESH = """
         )
         redirect_stdout(devnull) do
             try
-                solve_request(request)
-            catch
+                solve_request(JSON.parse(JSON.json(request)))
+                image_mesh = joinpath(directory, "workload_xy.msh")
+                write(image_mesh, workload_plate_mesh())
+                representative = deepcopy(request)
+                representative["frequencies_hz"] = [1000.0, 20000.0]
+                representative["config"] = merge(representative["config"], Dict{String,Any}(
+                    "mesh_file" => image_mesh, "symmetry" => "xy", "singular_order" => 4,
+                    "surface_traces_enabled" => true,
+                    "regular_quadrature_mode" => "fixed", "diagonal_enabled" => true,
+                    "step_size" => 5.0, "max_angle" => 180.0,
+                    "spherical_grid" => Dict("theta_count" => 37, "phi_count" => 72,
+                                             "theta_max_deg" => 180.0),
+                    "spherical_sampling_enabled" => true,
+                    "spherical_sampling_points" => 37 * 72,
+                ))
+                solve_request(JSON.parse(JSON.json(representative)))
+            catch exception
+                @warn "BEAT host precompile workload failed" exception=(exception, catch_backtrace())
                 # A workload that cannot solve still leaves everything it did
                 # reach compiled, and a build must not fail over an
                 # optimisation.
@@ -138,6 +174,7 @@ const WORKLOAD_MESH = """
     # through the dynamic `solve_request` call it makes.
     precompile(worker_loop, ())
     precompile(main, (Vector{String},))
+    precompile_metal_kernel_signatures()
 end
 
 end

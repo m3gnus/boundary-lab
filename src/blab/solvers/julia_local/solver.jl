@@ -24,6 +24,15 @@ so when a number has to be reproduced exactly, this variable gives back the
 old path, which *is* bit-identical, at the old start-up cost.
 """
 
+# Match the Metal bundle's dependency order to avoid invalidating its cache.
+let hint = lowercase(strip(get(ENV, "BLAB_BEAT_ENGINE_GPU_BACKEND", "")))
+    active = Base.active_project()
+    directory = active === nothing ? "" : lowercase(basename(dirname(active)))
+    if hint == "metal" || (isempty(hint) && directory == "julia_metal")
+        @eval import Metal
+    end
+end
+
 using JSON
 using LinearAlgebra
 using Printf
